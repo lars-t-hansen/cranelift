@@ -258,6 +258,9 @@ fn main() {
                     target_val = clap_target;
                 }
 
+                let (is_baldrdash, target_val, flag_set) =
+                    filter_for_baldrdash(target_val, &get_vec(rest_cmd.values_of("set")));
+
                 wasm::run(
                     get_vec(rest_cmd.values_of("file")),
                     rest_cmd.is_present("verbose"),
@@ -265,10 +268,11 @@ fn main() {
                     rest_cmd.is_present("check-translation"),
                     rest_cmd.is_present("print"),
                     rest_cmd.is_present("disasm"),
-                    &get_vec(rest_cmd.values_of("set")),
-                    target_val,
+                    &flag_set,
+                    &target_val,
                     rest_cmd.is_present("print-size"),
                     rest_cmd.is_present("time-passes"),
+                    is_baldrdash,
                 )
             };
 
@@ -288,4 +292,23 @@ fn main() {
         io::stderr().write_all(msg.as_bytes()).unwrap();
         process::exit(1);
     }
+}
+
+fn filter_for_baldrdash(target_val: &str, orig_flag_set: &[String]) -> (bool, String, Vec<String>) {
+    let (is_baldrdash, new_target_val) = if target_val == "x86_64-baldrdash" {
+        (true, String::from("x86_64-unknown-unknown has_sse3 has_sse41 has_sse42 has_popcnt has_avx has_bmi1 has_bmi2 has_lzcnt"))
+    } else {
+        (false, String::from(target_val))
+    };
+
+    let mut flag_set = vec![];
+    orig_flag_set.iter().for_each(|s| flag_set.push(s.clone()));
+    if is_baldrdash {
+        flag_set.push(String::from("baldrdash_prologue_words=3"));
+        flag_set.push(String::from("allones_funcaddrs"));
+        flag_set.push(String::from("probestack_enabled=false"));
+        flag_set.push(String::from("opt_level=best"));
+        flag_set.push(String::from("jump_tables_enabled=false")); // TODO
+    };
+    (is_baldrdash, new_target_val, flag_set)
 }

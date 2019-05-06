@@ -10,6 +10,7 @@
 use crate::disasm::{print_all, PrintRelocs, PrintTraps};
 use crate::utils::{parse_sets_and_triple, read_to_end};
 use cranelift_codegen::print_errors::{pretty_error, pretty_verifier_error};
+use cranelift_codegen::isa::{CallConv, TargetFrontendConfig};
 use cranelift_codegen::settings::FlagsOrIsa;
 use cranelift_codegen::timing;
 use cranelift_codegen::Context;
@@ -47,6 +48,7 @@ pub fn run(
     flag_triple: &str,
     flag_print_size: bool,
     flag_report_times: bool,
+    flag_baldrdash: bool,
 ) -> Result<(), String> {
     let parsed = parse_sets_and_triple(flag_set, flag_triple)?;
 
@@ -61,6 +63,7 @@ pub fn run(
             flag_print_size,
             flag_print_disasm,
             flag_report_times,
+            flag_baldrdash,
             &path.to_path_buf(),
             &name,
             parsed.as_fisa(),
@@ -77,6 +80,7 @@ fn handle_module(
     flag_print_size: bool,
     flag_print_disasm: bool,
     flag_report_times: bool,
+    flag_baldrdash: bool,
     path: &PathBuf,
     name: &str,
     fisa: FlagsOrIsa,
@@ -108,7 +112,18 @@ fn handle_module(
         }
     };
 
-    let mut dummy_environ = DummyEnvironment::new(isa.frontend_config(), ReturnMode::NormalReturns);
+    let frontend_config = {
+        let cfg = isa.frontend_config();
+        if flag_baldrdash {
+            TargetFrontendConfig {
+                default_call_conv: CallConv::Baldrdash,
+                pointer_width: cfg.pointer_width,
+            }
+        } else {
+            cfg
+        }
+    };
+    let mut dummy_environ = DummyEnvironment::new(frontend_config, ReturnMode::NormalReturns);
     translate_module(&module_binary, &mut dummy_environ).map_err(|e| e.to_string())?;
 
     let _ = terminal.fg(term::color::GREEN);
