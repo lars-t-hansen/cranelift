@@ -12,8 +12,9 @@ use crate::regalloc::coalescing::Coalescing;
 use crate::regalloc::coloring::Coloring;
 use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::regalloc::liveness::Liveness;
-use crate::regalloc::reload::Reload;
-use crate::regalloc::spilling::Spilling;
+use crate::regalloc::splitting::Splitting;
+//use crate::regalloc::reload::Reload;
+//use crate::regalloc::spilling::Spilling;
 use crate::regalloc::virtregs::VirtRegs;
 use crate::result::CodegenResult;
 use crate::timing;
@@ -29,8 +30,9 @@ pub struct Context {
     coalescing: Coalescing,
     topo: TopoOrder,
     tracker: LiveValueTracker,
-    spilling: Spilling,
-    reload: Reload,
+    splitting: Splitting,
+//    spilling: Spilling,
+//    reload: Reload,
     coloring: Coloring,
 }
 
@@ -46,8 +48,9 @@ impl Context {
             coalescing: Coalescing::new(),
             topo: TopoOrder::new(),
             tracker: LiveValueTracker::new(),
-            spilling: Spilling::new(),
-            reload: Reload::new(),
+            splitting: Splitting::new(),
+//            spilling: Spilling::new(),
+//            reload: Reload::new(),
             coloring: Coloring::new(),
         }
     }
@@ -59,8 +62,9 @@ impl Context {
         self.coalescing.clear();
         self.topo.clear();
         self.tracker.clear();
-        self.spilling.clear();
-        self.reload.clear();
+        self.splitting.clear();
+//        self.spilling.clear();
+//        self.reload.clear();
         self.coloring.clear();
     }
 
@@ -83,7 +87,7 @@ impl Context {
         // `Liveness` and `Coloring` are self-clearing.
         self.virtregs.clear();
 
-        // Tracker state (dominator live sets) is actually reused between the spilling and coloring
+        // Tracker state (dominator live sets) is actually reused between the splitting and coloring
         // phases.
         self.tracker.clear();
 
@@ -126,7 +130,19 @@ impl Context {
             }
         }
 
+        // Pass: Live range splitting / spill+reload
+        self.splitting.run(
+            isa,
+            func,
+            domtree,
+            &mut self.liveness,
+            &self.virtregs,
+            &mut self.topo,
+            &mut self.tracker,
+        );
+        
         // Pass: Spilling.
+/*
         self.spilling.run(
             isa,
             func,
@@ -164,6 +180,7 @@ impl Context {
             &mut self.topo,
             &mut self.tracker,
         );
+*/
 
         if isa.flags().enable_verifier() {
             let ok = verify_context(func, cfg, domtree, isa, &mut errors).is_ok()

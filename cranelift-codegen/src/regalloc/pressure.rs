@@ -1,6 +1,6 @@
 //! Register pressure tracking.
 //!
-//! SSA-based register allocation depends on a spilling phase that "lowers register pressure
+//! SSA-based register allocation depends on a splitting phase that "lowers register pressure
 //! sufficiently". This module defines the data structures needed to measure register pressure
 //! accurately enough to guarantee that the coloring phase will not run out of registers.
 //!

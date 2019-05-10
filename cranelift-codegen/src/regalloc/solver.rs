@@ -63,9 +63,9 @@
 //! constraints are handled by earlier passes:
 //!
 //! - There will be enough free registers available for the defines. Ensuring this is the primary
-//!   purpose of the spilling phase.
+//!   purpose of the splitting phase.
 //! - When the same value is used for multiple operands, the intersection of operand constraints is
-//!   non-empty. The spilling phase will insert copies to handle mutually incompatible constraints,
+//!   non-empty. The splitting phase will insert copies to handle mutually incompatible constraints,
 //!   such as when the same value is bound to two different function arguments.
 //! - Values bound to tied operands must be killed by the instruction. Also enforced by the
 //!   spiller.

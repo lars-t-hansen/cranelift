@@ -22,7 +22,7 @@
 //! from the set of live values at the dominating branch instruction and filtering it with
 //! `livein_local_end`. These sets do not need to be stored in the liveness analysis.
 //!
-//! The secondary consumer of the liveness analysis is the spilling pass which needs to count the
+//! The secondary consumer of the liveness analysis is the splitting pass which needs to count the
 //! number of live values at every program point and insert spill code until the number of
 //! registers needed is small enough.
 //!
