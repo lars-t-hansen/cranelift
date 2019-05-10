@@ -14,9 +14,9 @@ mod coalescing;
 mod context;
 mod diversion;
 mod pressure;
-//mod reload;
+mod reload;
 mod solver;
-//mod spilling;
+mod spilling;
 mod splitting;
 
 pub use self::context::Context;

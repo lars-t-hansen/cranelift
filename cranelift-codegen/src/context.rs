@@ -31,6 +31,7 @@ use crate::timing;
 use crate::unreachable_code::eliminate_unreachable_code;
 use crate::verifier::{verify_context, verify_locations, VerifierErrors, VerifierResult};
 use std::vec::Vec;
+use std::env;
 
 /// Persistent data structures and compilation pipeline.
 pub struct Context {
@@ -304,8 +305,9 @@ impl Context {
 
     /// Run the register allocator.
     pub fn regalloc(&mut self, isa: &TargetIsa) -> CodegenResult<()> {
+        let use_splitting = env::var("CL_SPLITTING").is_ok();
         self.regalloc
-            .run(isa, &mut self.func, &self.cfg, &mut self.domtree)
+            .run(use_splitting, isa, &mut self.func, &self.cfg, &mut self.domtree)
     }
 
     /// Insert prologue and epilogues after computing the stack frame layout.

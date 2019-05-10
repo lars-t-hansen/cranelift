@@ -13,8 +13,8 @@ use crate::regalloc::coloring::Coloring;
 use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::regalloc::liveness::Liveness;
 use crate::regalloc::splitting::Splitting;
-//use crate::regalloc::reload::Reload;
-//use crate::regalloc::spilling::Spilling;
+use crate::regalloc::reload::Reload;
+use crate::regalloc::spilling::Spilling;
 use crate::regalloc::virtregs::VirtRegs;
 use crate::result::CodegenResult;
 use crate::timing;
@@ -31,8 +31,8 @@ pub struct Context {
     topo: TopoOrder,
     tracker: LiveValueTracker,
     splitting: Splitting,
-//    spilling: Spilling,
-//    reload: Reload,
+    spilling: Spilling,
+    reload: Reload,
     coloring: Coloring,
 }
 
@@ -49,8 +49,8 @@ impl Context {
             topo: TopoOrder::new(),
             tracker: LiveValueTracker::new(),
             splitting: Splitting::new(),
-//            spilling: Spilling::new(),
-//            reload: Reload::new(),
+            spilling: Spilling::new(),
+            reload: Reload::new(),
             coloring: Coloring::new(),
         }
     }
@@ -63,8 +63,8 @@ impl Context {
         self.topo.clear();
         self.tracker.clear();
         self.splitting.clear();
-//        self.spilling.clear();
-//        self.reload.clear();
+        self.spilling.clear();
+        self.reload.clear();
         self.coloring.clear();
     }
 
@@ -74,6 +74,7 @@ impl Context {
     /// location that is consistent with instruction encoding constraints.
     pub fn run(
         &mut self,
+        use_splitting: bool,
         isa: &TargetIsa,
         func: &mut Function,
         cfg: &ControlFlowGraph,
@@ -130,57 +131,57 @@ impl Context {
             }
         }
 
-        // Pass: Live range splitting / spill+reload
-        self.splitting.run(
-            isa,
-            func,
-            domtree,
-            &mut self.liveness,
-            &self.virtregs,
-            &mut self.topo,
-            &mut self.tracker,
-        );
-        
-        // Pass: Spilling.
-/*
-        self.spilling.run(
-            isa,
-            func,
-            domtree,
-            &mut self.liveness,
-            &self.virtregs,
-            &mut self.topo,
-            &mut self.tracker,
-        );
+        if use_splitting {
+            // Pass: Live range splitting / spill+reload
+            self.splitting.run(
+                isa,
+                func,
+                domtree,
+                &mut self.liveness,
+                &self.virtregs,
+                &mut self.topo,
+                &mut self.tracker,
+            );
+        } else {
+            // Pass: Spilling.
+            self.spilling.run(
+                isa,
+                func,
+                domtree,
+                &mut self.liveness,
+                &self.virtregs,
+                &mut self.topo,
+                &mut self.tracker,
+            );
 
-        if isa.flags().enable_verifier() {
-            let ok = verify_context(func, cfg, domtree, isa, &mut errors).is_ok()
-                && verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok()
-                && verify_cssa(
-                    func,
-                    cfg,
-                    domtree,
-                    &self.liveness,
-                    &self.virtregs,
-                    &mut errors,
-                )
-                .is_ok();
+            if isa.flags().enable_verifier() {
+                let ok = verify_context(func, cfg, domtree, isa, &mut errors).is_ok()
+                    && verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok()
+                    && verify_cssa(
+                        func,
+                        cfg,
+                        domtree,
+                        &self.liveness,
+                        &self.virtregs,
+                        &mut errors,
+                    )
+                    .is_ok();
 
-            if !ok {
-                return Err(errors.into());
+                if !ok {
+                    return Err(errors.into());
+                }
             }
-        }
 
-        // Pass: Reload.
-        self.reload.run(
-            isa,
-            func,
-            domtree,
-            &mut self.liveness,
-            &mut self.topo,
-            &mut self.tracker,
-        );
-*/
+            // Pass: Reload.
+            self.reload.run(
+                isa,
+                func,
+                domtree,
+                &mut self.liveness,
+                &mut self.topo,
+                &mut self.tracker,
+            );
+        }
 
         if isa.flags().enable_verifier() {
             let ok = verify_context(func, cfg, domtree, isa, &mut errors).is_ok()

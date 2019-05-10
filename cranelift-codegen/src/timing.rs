@@ -66,9 +66,9 @@ define_passes! {
     regalloc: "Register allocation",
     ra_liveness: "RA liveness analysis",
     ra_cssa: "RA coalescing CSSA",
-//    ra_spilling: "RA spilling",
+    ra_spilling: "RA spilling",
     ra_splitting: "RA splitting",
-//    ra_reload: "RA reloading",
+    ra_reload: "RA reloading",
     ra_coloring: "RA coloring",
 
     prologue_epilogue: "Prologue/epilogue insertion",
