@@ -132,7 +132,10 @@ impl Context {
         }
 
         if use_splitting {
-            // Pass: Live range splitting / spill+reload
+            // Pass: Live range splitting / spill+reload.
+            //
+            // TODO: This changes live ranges, so we must recompute
+            // after, and use the new ranges subsequently.
             self.splitting.run(
                 isa,
                 func,

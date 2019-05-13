@@ -1,10 +1,11 @@
 //! Splitting pass.
 //!
-//! The splitting pass is the first to run after the liveness analysis.
+//! The splitting pass is the first to run after the liveness analysis.  [Not actually true.  The
+//! CSSA conversion also uses the liveness info.]
 //!
 //! The splitter's primary function is to ensure that the register pressure never exceeds the number
-//! of available registers by splitting the live ranges of values, by inserting copies, typically
-//! through memory via spills and reloads, or in some special cases register-to-register.
+//! of available registers by splitting the live ranges of values by inserting copies, typically
+//! through memory via spills and reloads but in some special cases just register-to-register.
 //!
 //! Its secondary function is to insert copies so as to honor instruction operand constraints.  Some
 //! instruction operand constraints may require additional registers to resolve:
@@ -44,6 +45,10 @@
 //! argument.  (This is subject to the number of live values across the call vs the number of
 //! callee-saves registers, as well.)
 //!
+//! Splitting necessarily affects the live ranges of values: a value's live range ends where it is
+//! spilled (the spill consumes the value); a later reload from the spill creates a new value with a
+//! new live range.
+//!
 //!
 //! Inserting local copies.
 //!
@@ -62,6 +67,8 @@
 //! ... = inst v7
 //! ... v2 ...
 //!
+//! Since the copy does not live until a control transfer its introduction cannot violate CSSA form.
+//!
 //!
 //! Inserting nonlocal copies.
 //!
@@ -70,6 +77,14 @@
 //! the renaming and may require inserting new phis.
 //!
 //! ...
+//!
+//! Question: can the copy violate CSSA form?  Consider a diamond where there's a spill/reload on
+//! one branch but not on the other.  The join will get a phi.  The unaffected branch is fine.  The
+//! affected branch will introduce a new name for the reloaded value and the spilled value will be
+//! dead.  So at the jump to the join the new value (being new) cannot interfere with any of the
+//! other ebb parameters.
+//!
+//!     
 
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
@@ -160,6 +175,92 @@ impl Splitting {
     }
 }
 
+// PoC v1 outline.
+//
+// In PoC v1 we split live ranges across function calls in a simple way, only.  We operate only on
+// functions that do not require spilling in non-call contexts and that take only integer parameters
+// in integer registers (no stack args).  We ignore callee-saves registers.  The PoC as envisioned
+// will not work with all wasm code, it is a small-scale experiment.
+//
+// The point of PoC v1 is twofold: (1) to test the copy-insertion algorithm on the SSA form, and (2)
+// to verify that splitting across calls is enough to deal with one huge problem of the old
+// spill/reload architecture, wherein every value live across a call is marked as spilled and thus
+// results in very pessimal code everywhere.
+//
+// We will spill live values immediately before the call and fill directly after the call, thus
+// splitting the live ranges and requiring correct copy insertion & renaming throughout the
+// function:
+//
+//   call $f (v1, v7, v10 ) // v7 and v10 are live past the call
+//   ...
+//   ... = inst v7, v10     // used here
+//
+// becomes
+//
+//   s7 = spill v7
+//   s10 = spill v10
+//   call $f (v1, v7, v10)  // live ranges of v1, v7, v10 now end here
+//   v7' = reload s7
+//   v10' = reload s10
+//   ...
+//   ... = inst v7', v10'   // uses renamed v7, v10
+//
+// Parameters that arrive in registers will be copied to vregs on entry.
+//
+// We will panic if:
+// - there are incoming stack args
+// - register pressure becomes too large at any time
+//
+// Since we have enough registers we'll not need to worry about the situation where the ebb takes a
+// spill slot argument.
+//
+// Since we'll spill only across calls for the PoC, all spill slots will be dead after we fill just
+// after the call, and we don't care how slots are managed - we can use a stack, say.
+//
+// Since we shorten live ranges and our liveness system doesn't have a way of incrementally updating
+// that, we'll need to recompute all the liveness information following splitting, adding to the
+// cost of splitting.
+//
+//
+// Braun & Hack works by computing the distance everywhere first, not sure if this really requires
+// liveness info or if it works just bottom-up on local info, anyway this yields a kind of liveness
+// structure with block-in block-out data.  Then determination is made at each block boundary (in
+// some top-down order) about which block params and live-in values will be in registers and which
+// will not, based on info from the predecessors.  Code is inserted to ensure that each predecessor
+// sets things up right.  Then MIN is run locally, using local information + global next-use
+// information.  This inserts spills and fills *within the block* and creates an outgoing register
+// state.  We spill a value only once but if it's evicted more than once we can reload more than
+// once.  A fill however becomes an SSA value, each fill is a new one, and until it must be evicted
+// we keep using that, again *within the block*.
+
+
+// Open questions:
+//  - let's just hope that incremental update of liveness is not needed along the way...
+//    for PoC v1 we insert reloads, defining new names.  But we need to be sure that
+//    the old names that we have spilled don't contribute to register pressure along the
+//    tails of their live ranges, we need to discount them there.  The spiller probably
+//    uses affinity to avoid this (once a value has been spilled it's not an issue).
+//
+//    Well - is that a red herring?  
+//
+//  - aliases that point to existing names can be a problem?  who inserts aliases?
+//
+//
+// "Fix later":
+//  - spilling as a result of register pressure, generally
+//  - moving the fill to the before the next use(s) after a required spill point
+//  - managing spill storage properly (reducing stack usage)
+//  - handle non-integer args
+//  - handle stack args that start out "spilled" in their home locations
+//  - handle spill slots at ebb boundaries
+//
+// "Fix much later":
+//  - moving the spill to after the last use(s) before a required spill point
+//  - use callee-saves registers
+//  - incremental update of liveness information
+//
+// Here, a "required spill point" is just a call in PoC v1 but of course more general later
+
 impl<'a> Context<'a> {
     fn run(&mut self, tracker: &mut LiveValueTracker) {
         self.topo.reset(self.cur.func.layout.ebbs());
@@ -170,5 +271,27 @@ impl<'a> Context<'a> {
 
     fn visit_ebb(&mut self, ebb: Ebb, tracker: &mut LiveValueTracker) {
         debug!("Splitting {}:", ebb);
+        self.cur.goto_top(ebb);
+        self.visit_ebb_header(ebb, tracker);
+        tracker.drop_dead_params();
+//        self.process_spills(tracker);
+
+        while let Some(inst) = self.cur.next_inst() {
+            if !self.cur.func.dfg[inst].opcode().is_ghost() {
+                self.visit_inst(inst, ebb, tracker);
+            } else {
+                let (_throughs, kills) = tracker.process_ghost(inst);
+                self.free_regs(kills);
+            }
+            tracker.drop_dead(inst);
+//            self.process_spills(tracker);
+        }
+    }
+
+    fn visit_ebb_header(&mut self, ebb: Ebb, tracker: &mut LiveValueTracker) {
+    }
+
+    fn visit_inst(&mut self, inst: Inst, ebb: Ebb, tracker: &mut LiveValueTracker) {
+        debug!("Inst {}, {}", self.cur.display_inst(inst), self.pressure);
     }
 }

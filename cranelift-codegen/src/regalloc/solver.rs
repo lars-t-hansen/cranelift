@@ -68,9 +68,9 @@
 //!   non-empty. The splitting phase will insert copies to handle mutually incompatible constraints,
 //!   such as when the same value is bound to two different function arguments.
 //! - Values bound to tied operands must be killed by the instruction. Also enforced by the
-//!   spiller.
+//!   splitter.
 //! - Values used by register operands are in registers, and values used by stack operands are in
-//!   stack slots. This is enforced by the reload pass.
+//!   stack slots. This is enforced by the reload pass.  TODO: the splitter.
 //!
 //! # Solver algorithm
 //!
