@@ -18,6 +18,7 @@ mod reload;
 mod safepoint;
 mod solver;
 mod spilling;
+mod splitting;
 
 pub use self::context::Context;
 pub use self::diversion::RegDiversions;

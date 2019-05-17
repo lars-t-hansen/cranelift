@@ -15,6 +15,7 @@ use crate::regalloc::liveness::Liveness;
 use crate::regalloc::reload::Reload;
 use crate::regalloc::safepoint::emit_stackmaps;
 use crate::regalloc::spilling::Spilling;
+use crate::regalloc::splitting::Splitting;
 use crate::regalloc::virtregs::VirtRegs;
 use crate::result::CodegenResult;
 use crate::timing;
@@ -22,6 +23,7 @@ use crate::topo_order::TopoOrder;
 use crate::verifier::{
     verify_context, verify_cssa, verify_liveness, verify_locations, VerifierErrors,
 };
+use std::env;
 
 /// Persistent memory allocations for register allocation.
 pub struct Context {
@@ -31,6 +33,7 @@ pub struct Context {
     topo: TopoOrder,
     tracker: LiveValueTracker,
     spilling: Spilling,
+    splitting: Splitting,
     reload: Reload,
     coloring: Coloring,
 }
@@ -48,6 +51,7 @@ impl Context {
             topo: TopoOrder::new(),
             tracker: LiveValueTracker::new(),
             spilling: Spilling::new(),
+            splitting: Splitting::new(),
             reload: Reload::new(),
             coloring: Coloring::new(),
         }
@@ -61,6 +65,7 @@ impl Context {
         self.topo.clear();
         self.tracker.clear();
         self.spilling.clear();
+        self.splitting.clear();
         self.reload.clear();
         self.coloring.clear();
     }
@@ -92,6 +97,17 @@ impl Context {
         // Tracker state (dominator live sets) is actually reused between the spilling and coloring
         // phases.
         self.tracker.clear();
+
+        // Pass: Split live ranges of values that are live across calls.  Experimental.
+        if env::var("CALL_SPLITTING").is_ok() {
+            self.splitting.split_across_calls(isa, func, cfg, domtree, &mut self.topo);
+
+            if isa.flags().enable_verifier() {
+                if !verify_context(func, cfg, domtree, isa, &mut errors).is_ok() {
+                    return Err(errors.into());
+                }
+            }
+        }
 
         // Pass: Liveness analysis.
         self.liveness.compute(isa, func, cfg);
