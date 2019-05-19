@@ -85,13 +85,42 @@ impl Splitting {
         topo: &mut TopoOrder,
     ) {
         let _tt = timing::ra_splitting();
-        debug!("Splitting for:\n{}", func.display(isa));
+        debug!("Splitting across calls for:\n{}", func.display(isa));
         let mut ctx = Context {
             cur: EncCursor::new(func, isa),
             cfg,
             domtree,
             topo,
         };
+
+        // Several passes here, order uncertain:
+        //
+        // - compute live-in / live-out set for all the blocks, this is an upward walk of the
+        //   dominator tree with a worklist presumably?
+        //
+        // - make a pass across the cfg, insert copies.  we need to know, for each instruction,
+        //   which values that are last-use in the instruction so that we don't save them; all other
+        //   values that are in the live set (but are not defined) must be saved/restored.  we can
+        //   compute last-use locally from the live-out set and a backward scan of the instructions
+        //   if need be, so we don't need to store it for every instruction.  It is probably ok to
+        //   insert copies by walking upward, so long as we remember the renamings we've done (these
+        //   may turn into chains of renamings?).  We can do blocks in any order.
+        //
+        // - perform ssa renaming (uses liveness in unspecified way, need to look at algorithms)
+        //
+        // We can compute liveness (collect uses) and rename in one pass by walking up the tree,
+        // collecting uses.  Only the last rename in a block need be remembered for the ssa
+        // renaming, since for all others the renaming is local and we must just do it, ie, if there
+        // are two calls back-to-back across which we save x, we will rename for the last call
+        // and remember this renaming, and then as we move up the block we will ...
+        //
+        // the problem, moving up the block, is that we must rename locally below each renaming
+        // until the next one, until the end of the block, or until the value dies.
+        //
+        // I think realistically we compute liveness and uses in an up pass and then do another down
+        // pass for the initial renaming, and then do the ssa fixup.  We need compute uses only for
+        // values that are live 
+        
         ctx.run()
     }
 }
