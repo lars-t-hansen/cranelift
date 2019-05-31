@@ -230,11 +230,14 @@ impl<'a> Context<'a> {
         self.visit_ebb_header(ebb, tracker);
         tracker.drop_dead_params();
 
-        while let Some(inst) = self.cur.next_inst() {
+        self.cur.goto_first_inst(ebb);
+        while let Some(inst) = self.cur.current_inst() {
             if !self.cur.func.dfg[inst].opcode().is_ghost() {
+                // visit_inst() advances the instruction
                 self.visit_inst(inst, ebb, tracker);
             } else {
                 let (_throughs, _kills) = tracker.process_ghost(inst);
+                self.cur.next_inst();
             }
             tracker.drop_dead(inst);
         }
@@ -255,6 +258,8 @@ impl<'a> Context<'a> {
         debug_assert_eq!(self.cur.current_inst(), Some(inst));
         debug_assert_eq!(self.cur.current_ebb(), Some(ebb));
 
+        self.cur.use_srcloc(inst);
+
         // Update the live value tracker with this instruction.
         let (throughs, _kills, _defs) = tracker.process_inst(inst, &self.cur.func.dfg, self.liveness);
 
@@ -273,12 +278,28 @@ impl<'a> Context<'a> {
 
         let call_sig = self.cur.func.dfg.call_signature(inst);
         if call_sig.is_some() {
+            // Create temps before the instruction
+            let mut temps = vec![];
             for lv in throughs {
                 if lv.affinity.is_reg() {
-                    let copy = self.cur.ins().copy(lv.value);
+                    let temp = self.cur.ins().copy(lv.value);
+                    temps.push(temp);
+                }
+            }
+            // Move to next instruction so that we can insert copies after the call
+            self.cur.next_inst();
+            // Create copies of the temps after the instruction
+            let mut i = 0;
+            for lv in throughs {
+                if lv.affinity.is_reg() {
+                    let temp = temps[i];
+                    i += 1;
+                    let copy = self.cur.ins().copy(temp);
                     self.renamed[lv.value].push(copy);
                 }
             }
+        } else {
+            self.cur.next_inst();
         }
     }
 }
