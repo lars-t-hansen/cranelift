@@ -91,23 +91,31 @@ impl Context {
 
         let mut errors = VerifierErrors::default();
 
+        // Pass: Split live ranges of values that are live across calls.  Experimental.
+        if env::var("CALL_SPLITTING").is_ok() {
+            self.tracker.clear();
+            self.liveness.compute(isa, func, cfg);
+            self.splitting.split_across_calls(isa,
+                                              func,
+                                              domtree,
+                                              &self.liveness,
+                                              &mut self.topo,
+                                              &mut self.tracker);
+            if isa.flags().enable_verifier() {
+                if verify_context(func, cfg, domtree, isa, &mut errors).is_err() {
+                    return Err(errors.into());
+                }
+            }
+            // Liveness information was invalidated by splitting.
+            self.liveness.clear();
+        }
+
         // `Liveness` and `Coloring` are self-clearing.
         self.virtregs.clear();
 
         // Tracker state (dominator live sets) is actually reused between the spilling and coloring
         // phases.
         self.tracker.clear();
-
-        // Pass: Split live ranges of values that are live across calls.  Experimental.
-        if env::var("CALL_SPLITTING").is_ok() {
-            self.splitting.split_across_calls(isa, func, cfg, domtree, &mut self.topo);
-
-            if isa.flags().enable_verifier() {
-                if !verify_context(func, cfg, domtree, isa, &mut errors).is_ok() {
-                    return Err(errors.into());
-                }
-            }
-        }
 
         // Pass: Liveness analysis.
         self.liveness.compute(isa, func, cfg);

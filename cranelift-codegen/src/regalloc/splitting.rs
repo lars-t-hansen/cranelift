@@ -44,10 +44,12 @@
 // In general the introduction of copies like this requires a renaming of values throughout the
 // CFG, which may result in the insertion of new phi nodes, see:
 //
-//   M. Braun, S. Hack: Register Spilling and Live-Range Splitting for SSA-Form Programs, Compiler
-//   Conference 2009
+//   M. Braun, S. Hack: Register Spilling and Live-Range Splitting for SSA-Form Programs, in
+//   Compiler Construction 2009, LNCS Volume 5501.  (This references a 1998 paper by Sastry and Ju
+//   for an SSA renaming algorithm but Hack's dissertation (below) has the better description.)
 //
-//   S. Hack: Register Allocation for Programs in SSA Form, PhD Dissertation, 2006
+//   S. Hack: Register Allocation for Programs in SSA Form, PhD Dissertation, University of
+//   Karlsruhe, 2006.
 //
 //
 // Algorithm.
@@ -57,11 +59,11 @@
 // This yields information needed by step 1.
 //
 //
-// Step 1: insert stack-allocated temps, perform local renaming, collect information
+// Step 1: insert stack-allocated temps and collect information
 //
-// Together with the dominator tree and the live value tracker we can compute live-in sets for EBBs
-// and defs, kills, and throughs for each instruction.  We traverse the EBBs in top-down domtree
-// order and process instructions in each EBB in top-down order.
+// Using the dominator tree and the live value tracker we can compute live-in sets for EBBs and
+// defs, kills, and throughs for each instruction.  We traverse the EBBs in top-down domtree order
+// and process instructions in each EBB in top-down order.
 //
 // REDEFINED = {}  // map from value -> value
 // EXITS = {}      // map from instruction -> (map from value -> value)
@@ -147,26 +149,33 @@
 // pass for the initial renaming, and then do the ssa fixup.  We need compute uses only for
 // values that are live 
 
+use crate::entity::SecondaryMap;
+use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
-use crate::flowgraph::ControlFlowGraph;
-use crate::ir::{Ebb, Function};
+use crate::ir::{Ebb, Function, Inst, InstBuilder, Value};
 use crate::isa::TargetIsa;
 use crate::timing;
+use crate::regalloc::liveness::Liveness;
 use crate::topo_order::TopoOrder;
+use std::vec::Vec;
 use log::debug;
 
 /// Persistent data structures for the splitting pass.
 pub struct Splitting {
+    renamed: SecondaryMap<Value, Vec<Value>>,        // Placeholder
 }
 
 /// Context data structure that gets instantiated once per pass.
 struct Context<'a> {
+    liveness: &'a Liveness,
+
+    renamed: &'a mut SecondaryMap<Value, Vec<Value>>,
+
     // Current instruction as well as reference to function and ISA.
     cur: EncCursor<'a>,
 
     // References to contextual data structures we need.
-    cfg: &'a ControlFlowGraph,
     domtree: &'a DominatorTree,
     topo: &'a mut TopoOrder,
 }
@@ -174,11 +183,14 @@ struct Context<'a> {
 impl Splitting {
     /// Create a new splitting data structure.
     pub fn new() -> Self {
-        Self { }
+        Self {
+            renamed: SecondaryMap::new(),
+        }
     }
 
     /// Clear all data structures in this splitting pass.
     pub fn clear(&mut self) {
+        self.renamed.clear();
     }
 
     /// Run the splitting algorithm over `func`.
@@ -186,32 +198,87 @@ impl Splitting {
         &mut self,
         isa: &TargetIsa,
         func: &mut Function,
-        cfg: &ControlFlowGraph,
         domtree: &DominatorTree,
+        liveness: &Liveness,
         topo: &mut TopoOrder,
+        tracker: &mut LiveValueTracker,
     ) {
         let _tt = timing::ra_splitting();
         debug!("Splitting across calls for:\n{}", func.display(isa));
         let mut ctx = Context {
             cur: EncCursor::new(func, isa),
-            cfg,
+            renamed: &mut self.renamed,
             domtree,
+            liveness,
             topo,
         };
-
-        
-        ctx.run()
+        ctx.run(tracker)
     }
 }
 
 impl<'a> Context<'a> {
-    fn run(&mut self) {
+    fn run(&mut self, tracker: &mut LiveValueTracker) {
         self.topo.reset(self.cur.func.layout.ebbs());
         while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
-            self.visit_ebb(ebb);
+            self.visit_ebb(ebb, tracker);
+        }
+        debug!("Renamed {:?}", self.renamed);
+    }
+
+    fn visit_ebb(&mut self, ebb: Ebb, tracker: &mut LiveValueTracker) {
+        self.cur.goto_top(ebb);
+        self.visit_ebb_header(ebb, tracker);
+        tracker.drop_dead_params();
+
+        while let Some(inst) = self.cur.next_inst() {
+            if !self.cur.func.dfg[inst].opcode().is_ghost() {
+                self.visit_inst(inst, ebb, tracker);
+            } else {
+                let (_throughs, _kills) = tracker.process_ghost(inst);
+            }
+            tracker.drop_dead(inst);
         }
     }
 
-    fn visit_ebb(&mut self, ebb: Ebb) {
+    fn visit_ebb_header(&mut self, ebb: Ebb, tracker: &mut LiveValueTracker) {
+        tracker.ebb_top(
+            ebb,
+            &self.cur.func.dfg,
+            self.liveness,
+            &self.cur.func.layout,
+            self.domtree,
+        );
+    }
+
+    fn visit_inst(&mut self, inst: Inst, ebb: Ebb, tracker: &mut LiveValueTracker) {
+        debug!("Inst {}", self.cur.display_inst(inst));
+        debug_assert_eq!(self.cur.current_inst(), Some(inst));
+        debug_assert_eq!(self.cur.current_ebb(), Some(ebb));
+
+        // Update the live value tracker with this instruction.
+        let (throughs, _kills, _defs) = tracker.process_inst(inst, &self.cur.func.dfg, self.liveness);
+
+        // If inst is a call, copy all register values that are live across the call into a temp
+        // across the call, so that the temps can be spilled but the values themselves can stay in
+        // registers.
+        //
+        // TODO: This is suboptimal if one of those values will be spilled anyway, that's an
+        // argument for integrating this splitting into the spilling phase.
+        //
+        // TODO: This ignores callee-saved registers.
+        //
+        // TODO: We can avoid saving values that can be rematerialized cheaply, namely, constants
+        // and any results of a GlobalValue computation.  In these cases, we must still insert code
+        // after the call (to rematerialize) but no code before the call.
+
+        let call_sig = self.cur.func.dfg.call_signature(inst);
+        if call_sig.is_some() {
+            for lv in throughs {
+                if lv.affinity.is_reg() {
+                    let copy = self.cur.ins().copy(lv.value);
+                    self.renamed[lv.value].push(copy);
+                }
+            }
+        }
     }
 }
