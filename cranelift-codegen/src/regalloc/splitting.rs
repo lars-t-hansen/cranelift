@@ -311,6 +311,11 @@ impl<'a> Context<'a> {
                     // found a new definition, rename the first use in use_inst with
                     // a reference to this definition
                     debug!("Replace a use of {} with a use of {}", renamed.value, new_defn);
+                    for arg in self.cur.func.dfg.inst_args_mut(*use_inst) {
+                        if *arg == renamed.value {
+                            *arg = new_defn;
+                        }
+                    }
                 } else {
                     debug!("No definition found");
                 }
