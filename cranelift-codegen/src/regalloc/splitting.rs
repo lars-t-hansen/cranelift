@@ -59,7 +59,7 @@
 // This yields information needed by step 1.
 //
 //
-// Step 1: insert stack-allocated temps and collect information
+// Step 1: insert stack-allocated temps and collect information.
 //
 // Using the dominator tree and the live value tracker we can compute live-in sets for EBBs and
 // defs, kills, and throughs for each instruction.  We traverse the EBBs in top-down domtree order
@@ -106,71 +106,81 @@
 // For each variable v
 
 
+    // TODO:
+    //
+    // - minimally we must compute the map { v -> U } for the uses of the original value v, where U
+    //   is a set of instructions that use v (this could include new instructions).  We can do this
+    //   in the same pass as copy insertion or we can make a separate pass.  If we do it in the same
+    //   pass we must collect info for all variables and then filter the final set down to the ones
+    //   that are renamed (which will likely be a smallish subset).  If we do it later it means a
+    //   second traversal over the graph but we can collect info (and allocate data) only for the
+    //   variables of interest, *and* it's not clear we must even use the live value tracker logic
+    //   in this second pass so it may not be so bad.
+    //
+    // - for each original v, we must have a set D that is the set of instructions that define v or
+    //   any of its renamings.  (possibly this should be broken down by ebb and sorted?)  For the
+    //   renamings we must collect this during the copy insertion pass but for the originals we must
+    //   either collect everything and then filter, or do a second pass.  We don't actually need
+    //   the original in this set because the original will dominate any renaming and "not found" is
+    //   a good proxy for the original definition.
+    //
+    // - for each instruction I we must have some way of getting from I to its EBB and to its
+    //   sequence number within the EBB
+    //
+    // - so long as we search the dominator tree upwards and we can compare the ordering of two
+    //   instructions within an EBB we can find the latest (re)definition of a variable in
+    //   an ebb
 
-// Several passes here, order uncertain:
-//
-// - compute live-in / live-out set for all the blocks, this is an upward walk of the cfg
-//   with a worklist presumably.
-//
-// - make a pass across the cfg, insert copies at calls.  we need to know, for each call
-//   instruction, which values that are last-use in the instruction so that we don't save
-//   them; all other values that are in the live set (but are not defined) must be
-//   saved/restored.  we can compute last-use locally from the live-out set and a backward
-//   scan of the instructions if need be, so we don't need to store it for every instruction,
-//   only for calls.
-//   It is probably ok to insert copies by walking upward, so long as we remember the
-//   renamings we've done (these may turn into chains of renamings?).  We can do blocks in any
-//   order.
-//
-// - if we have some way of recording the information per-call during the liveness analysis (if
-//   we reprocess a block then we throw away the information for calls in that block) then
-//   we can annotate each call during the liveness analysis, and we can collect the set of all
-//   call instructions for later use, so we don't need to re-scan anything.
-//
-// - since it's ssa form, do we really need to use a worklist?  can we just walk the
-// dominator tree bottom-up in one pass?  that would be sweet...
 
-// A central issue is not really finding the calls and inserting the copies, which seems
-// easy, but the subsequent renaming, and the needs of that renaming.
-
-//
-// - perform ssa renaming (uses liveness in unspecified way, need to look at algorithms)
-//
-// We can compute liveness (collect uses) and rename in one pass by walking up the tree,
-// collecting uses.  Only the last rename in a block need be remembered for the ssa
-// renaming, since for all others the renaming is local and we must just do it, ie, if there
-// are two calls back-to-back across which we save x, we will rename for the last call
-// and remember this renaming, and then as we move up the block we will ...
-//
-// the problem, moving up the block, is that we must rename locally below each renaming
-// until the next one, until the end of the block, or until the value dies.
-//
-// I think realistically we compute liveness and uses in an up pass and then do another down
-// pass for the initial renaming, and then do the ssa fixup.  We need compute uses only for
-// values that are live 
-
-use crate::entity::SecondaryMap;
+use crate::entity::{SparseMap, SparseMapValue};
 use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
-use crate::ir::{Ebb, Function, Inst, InstBuilder, Value};
+use crate::ir::{Ebb, Function, Inst, InstBuilder, Value, ValueDef};
+use crate::ir::{ExpandedProgramPoint, ProgramOrder};
 use crate::isa::TargetIsa;
 use crate::timing;
 use crate::regalloc::liveness::Liveness;
 use crate::topo_order::TopoOrder;
 use std::vec::Vec;
 use log::debug;
+use core::cmp;
+
+/// Tracks a value and its uses, and its new names.
+struct SplitValue {
+    value: Value,
+    new_names: Vec<Value>,
+    uses: Vec<Inst>,
+}
+
+impl SparseMapValue<Value> for SplitValue {
+    fn key(&self) -> Value {
+        self.value
+    }
+}
+
+impl SplitValue {
+    fn new(value: Value) -> Self {
+        Self {
+            value,
+            new_names: vec![],
+            uses: vec![],
+        }
+    }
+}
 
 /// Persistent data structures for the splitting pass.
 pub struct Splitting {
-    renamed: SecondaryMap<Value, Vec<Value>>,        // Placeholder
+    /// The `renamed` map has an entry for each original name whose live range is split and is keyed
+    /// on the original name.
+    renamed: SparseMap<Value, SplitValue>,        // Placeholder
 }
 
 /// Context data structure that gets instantiated once per pass.
 struct Context<'a> {
     liveness: &'a Liveness,
 
-    renamed: &'a mut SecondaryMap<Value, Vec<Value>>,
+    renamed: &'a mut SparseMap<Value, SplitValue>,
 
     // Current instruction as well as reference to function and ISA.
     cur: EncCursor<'a>,
@@ -184,7 +194,7 @@ impl Splitting {
     /// Create a new splitting data structure.
     pub fn new() -> Self {
         Self {
-            renamed: SecondaryMap::new(),
+            renamed: SparseMap::new(),
         }
     }
 
@@ -201,7 +211,6 @@ impl Splitting {
         domtree: &DominatorTree,
         liveness: &Liveness,
         topo: &mut TopoOrder,
-        tracker: &mut LiveValueTracker,
     ) {
         let _tt = timing::ra_splitting();
         debug!("Splitting across calls for:\n{}", func.display(isa));
@@ -212,29 +221,119 @@ impl Splitting {
             liveness,
             topo,
         };
-        ctx.run(tracker)
+        ctx.run()
     }
 }
 
 impl<'a> Context<'a> {
-    fn run(&mut self, tracker: &mut LiveValueTracker) {
+    fn run(&mut self) {
+        // Insert copy-to-temp before a call and copy-from-temp after a call, and retain information
+        // about the values that were copied and the names created after the call in `renamed`.
+        let mut tracker = LiveValueTracker::new();
         self.topo.reset(self.cur.func.layout.ebbs());
         while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
-            self.visit_ebb(ebb, tracker);
+            self.ebb_insert_temps(ebb, &mut tracker);
         }
-        debug!("Renamed {:?}", self.renamed);
+
+        // Collect use information for all variables in `renamed`.
+        for ebb in self.cur.func.layout.ebbs().collect::<Vec<Ebb>>() {
+            self.ebb_collect_uses(ebb);
+        }
+
+        for renamed in self.renamed.as_slice() {
+            debug!("Renamed {} -> {:?}, {:?}", renamed.value, renamed.new_names, renamed.uses);
+        }
+
+        // Correcting the references and inserting phis
+        //
+        // For each variable v
+        //   For each instruction I that has a use U of v
+        //     [[ Note I can have multiple uses ]]
+        //     For each block B up the dominator tree from the block of U,
+        //       If B has a definition for a new name of v
+        //         Let W be the last such definition in B preceding U
+        //           [[ Note B could be the block of U and there could be several renames there ]]
+        //         Update I to reference W for each use in I
+        //
+        // The layout is a ProgramOrder and has a cmp() method that should allow us to compare
+        // instructions within an ebb at least.
+
+        // For each renamed value renamed.value:
+        for renamed in self.renamed.as_slice() {
+            debug!("Renaming {}", renamed.value);
+            // For each use of renamed.value:
+            for use_inst in &renamed.uses {
+                debug!("  Use is {}", use_inst);
+                // For each block up the dominator tree from the use until we find a new definition
+                // or reach the top:
+                let mut target_ebb = self.cur.func.layout.inst_ebb(*use_inst).expect("not in layout");
+                debug!("  Target_ebb = {}", target_ebb);
+                let mut is_use_ebb = true;
+                let use_num = ExpandedProgramPoint::from(*use_inst);
+                let mut found = None;
+                loop {
+                    // If target_ebb has a definition for a new name of renamed.value, then pick the
+                    // latest such definition in the block, or if target_ebb is the ebb with the
+                    // use, the latest definition that precedes the use.
+                    let mut max_defn_num_in_ebb = ExpandedProgramPoint::from(target_ebb);
+                    for new_defn in &renamed.new_names {
+                        let defn_inst = match self.cur.func.dfg.value_def(*new_defn) {
+                            ValueDef::Result(inst, _) => inst,
+                            ValueDef::Param(_, _) => {
+                                panic!("Not in layout");
+                            }
+                        };
+                        let defn_ebb = self.cur.func.layout.inst_ebb(defn_inst).expect("not in layout");
+                        debug!("  Defn = {}, Defn_ebb = {}", defn_inst, defn_ebb);
+                        let defn_num = ExpandedProgramPoint::from(defn_inst);
+                        if defn_ebb == target_ebb &&
+                            (!is_use_ebb || self.cur.func.layout.cmp(defn_num, use_num) == cmp::Ordering::Less) {
+                                if found.is_none() ||
+                                    self.cur.func.layout.cmp(max_defn_num_in_ebb, defn_num) == cmp::Ordering::Less {
+                                found = Some(*new_defn);
+                                max_defn_num_in_ebb = defn_num;
+                            }
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+
+                    // Walk up the dominator tree to target_ebb's dominator.
+                    is_use_ebb = false;
+                    match self.domtree.idom(target_ebb) {
+                        Some(idom) => target_ebb = self.cur.func.layout.inst_ebb(idom).expect("idom not in layout"),
+                        None => { debug!("Failed to walk up"); break; }
+                    }
+                }
+
+                if let Some(new_defn) = found {
+                    // found a new definition, rename the first use in use_inst with
+                    // a reference to this definition
+                    debug!("Replace a use of {} with a use of {}", renamed.value, new_defn);
+                } else {
+                    debug!("No definition found");
+                }
+            }
+        }
     }
 
-    fn visit_ebb(&mut self, ebb: Ebb, tracker: &mut LiveValueTracker) {
+    fn ebb_insert_temps(&mut self, ebb: Ebb, tracker: &mut LiveValueTracker) {
         self.cur.goto_top(ebb);
-        self.visit_ebb_header(ebb, tracker);
+        tracker.ebb_top(
+            ebb,
+            &self.cur.func.dfg,
+            self.liveness,
+            &self.cur.func.layout,
+            self.domtree,
+        );
         tracker.drop_dead_params();
 
         self.cur.goto_first_inst(ebb);
         while let Some(inst) = self.cur.current_inst() {
             if !self.cur.func.dfg[inst].opcode().is_ghost() {
-                // visit_inst() advances the instruction
-                self.visit_inst(inst, ebb, tracker);
+                // visit_inst() applies the tracker and advances the instruction
+                self.inst_insert_temps(inst, ebb, tracker);
             } else {
                 let (_throughs, _kills) = tracker.process_ghost(inst);
                 self.cur.next_inst();
@@ -243,18 +342,7 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn visit_ebb_header(&mut self, ebb: Ebb, tracker: &mut LiveValueTracker) {
-        tracker.ebb_top(
-            ebb,
-            &self.cur.func.dfg,
-            self.liveness,
-            &self.cur.func.layout,
-            self.domtree,
-        );
-    }
-
-    fn visit_inst(&mut self, inst: Inst, ebb: Ebb, tracker: &mut LiveValueTracker) {
-        debug!("Inst {}", self.cur.display_inst(inst));
+    fn inst_insert_temps(&mut self, inst: Inst, ebb: Ebb, tracker: &mut LiveValueTracker) {
         debug_assert_eq!(self.cur.current_inst(), Some(inst));
         debug_assert_eq!(self.cur.current_ebb(), Some(ebb));
 
@@ -295,11 +383,37 @@ impl<'a> Context<'a> {
                     let temp = temps[i];
                     i += 1;
                     let copy = self.cur.ins().copy(temp);
-                    self.renamed[lv.value].push(copy);
+                    //let inst = self.cur.built_inst();
+                    if let Some(r) = self.renamed.get_mut(lv.value) {
+                        r.new_names.push(copy);
+                    } else {
+                        let mut r = SplitValue::new(lv.value);
+                        r.new_names.push(copy);
+                        self.renamed.insert(r);
+                    }
                 }
             }
         } else {
             self.cur.next_inst();
+        }
+    }
+
+    fn ebb_collect_uses(&mut self, ebb: Ebb) {
+        self.cur.goto_top(ebb);
+        while let Some(inst) = self.cur.next_inst() {
+            // Now inspect all the uses and if one is a Value defined in renamed, record this
+            // instruction with that info.
+            //
+            // TODO: ideally we only record it once, though that requires additional filtering.  As
+            // it happens, recording it multiple times is not bad, it means we'll visit the
+            // instruction with the use several times but each time we'll replace one use with the
+            // new one.  On the other hand, that means multiple searches up the tree.  On the third
+            // hand, how often is this an issue?
+            for arg in self.cur.func.dfg.inst_args(inst) {
+                if let Some(info) = self.renamed.get_mut(*arg) {
+                    info.uses.push(inst);
+                }
+            }
         }
     }
 }
