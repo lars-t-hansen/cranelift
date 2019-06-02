@@ -94,11 +94,8 @@ impl Context {
         // Pass: Split live ranges of values that are live across calls.  Experimental.
         if env::var("CALL_SPLITTING").is_ok() {
             self.liveness.compute(isa, func, cfg);
-            self.splitting.split_across_calls(isa,
-                                              func,
-                                              domtree,
-                                              &self.liveness,
-                                              &mut self.topo);
+            self.splitting
+                .split_across_calls(isa, func, domtree, &self.liveness, &mut self.topo);
             if isa.flags().enable_verifier() {
                 if verify_context(func, cfg, domtree, isa, &mut errors).is_err() {
                     return Err(errors.into());

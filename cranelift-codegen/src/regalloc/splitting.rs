@@ -53,7 +53,7 @@
 //
 //
 // Algorithm.
-// 
+//
 // Step 0: Compute liveness using the standard Cranelift algorithm.
 //
 // This yields information needed by step 1.
@@ -82,7 +82,7 @@
 //     Add I -> immutable copy of REDEFINED to EXITS
 //
 // (This step follows the spilling pass almost exactly, just does more.)
-// 
+//
 //
 // Maybe: Maintain a set `Renamed` of tuples (v, D, U) where v is an original value that was
 // renamed and D is the instruction that defines it, and U is the empty set (it is given a
@@ -90,7 +90,7 @@
 //
 //
 // Step 2: Collect use information
-// 
+//
 // Collect, for each use of (v, D, U) in Renamed, the set of instructions U that use v (ie
 // update the tuple for v in Renamed).
 //
@@ -105,46 +105,44 @@
 //
 // For each variable v
 
+// TODO:
+//
+// - minimally we must compute the map { v -> U } for the uses of the original value v, where U
+//   is a set of instructions that use v (this could include new instructions).  We can do this
+//   in the same pass as copy insertion or we can make a separate pass.  If we do it in the same
+//   pass we must collect info for all variables and then filter the final set down to the ones
+//   that are renamed (which will likely be a smallish subset).  If we do it later it means a
+//   second traversal over the graph but we can collect info (and allocate data) only for the
+//   variables of interest, *and* it's not clear we must even use the live value tracker logic
+//   in this second pass so it may not be so bad.
+//
+// - for each original v, we must have a set D that is the set of instructions that define v or
+//   any of its renamings.  (possibly this should be broken down by ebb and sorted?)  For the
+//   renamings we must collect this during the copy insertion pass but for the originals we must
+//   either collect everything and then filter, or do a second pass.  We don't actually need
+//   the original in this set because the original will dominate any renaming and "not found" is
+//   a good proxy for the original definition.
+//
+// - for each instruction I we must have some way of getting from I to its EBB and to its
+//   sequence number within the EBB
+//
+// - so long as we search the dominator tree upwards and we can compare the ordering of two
+//   instructions within an EBB we can find the latest (re)definition of a variable in
+//   an ebb
 
-    // TODO:
-    //
-    // - minimally we must compute the map { v -> U } for the uses of the original value v, where U
-    //   is a set of instructions that use v (this could include new instructions).  We can do this
-    //   in the same pass as copy insertion or we can make a separate pass.  If we do it in the same
-    //   pass we must collect info for all variables and then filter the final set down to the ones
-    //   that are renamed (which will likely be a smallish subset).  If we do it later it means a
-    //   second traversal over the graph but we can collect info (and allocate data) only for the
-    //   variables of interest, *and* it's not clear we must even use the live value tracker logic
-    //   in this second pass so it may not be so bad.
-    //
-    // - for each original v, we must have a set D that is the set of instructions that define v or
-    //   any of its renamings.  (possibly this should be broken down by ebb and sorted?)  For the
-    //   renamings we must collect this during the copy insertion pass but for the originals we must
-    //   either collect everything and then filter, or do a second pass.  We don't actually need
-    //   the original in this set because the original will dominate any renaming and "not found" is
-    //   a good proxy for the original definition.
-    //
-    // - for each instruction I we must have some way of getting from I to its EBB and to its
-    //   sequence number within the EBB
-    //
-    // - so long as we search the dominator tree upwards and we can compare the ordering of two
-    //   instructions within an EBB we can find the latest (re)definition of a variable in
-    //   an ebb
-
-
-use crate::entity::{SparseMap, SparseMapValue};
-use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
-use crate::ir::{Ebb, Function, Inst, InstBuilder, Value, ValueDef};
+use crate::entity::{SparseMap, SparseMapValue};
+use crate::ir::{Ebb, Function, Inst, InstBuilder, Value};
 use crate::ir::{ExpandedProgramPoint, ProgramOrder};
 use crate::isa::TargetIsa;
-use crate::timing;
+use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::regalloc::liveness::Liveness;
+use crate::timing;
 use crate::topo_order::TopoOrder;
-use std::vec::Vec;
-use log::debug;
 use core::cmp;
+use log::debug;
+use std::vec::Vec;
 
 /// Tracks a value and its uses, and its new names.
 struct SplitValue {
@@ -173,7 +171,7 @@ impl SplitValue {
 pub struct Splitting {
     /// The `renamed` map has an entry for each original name whose live range is split and is keyed
     /// on the original name.
-    renamed: SparseMap<Value, SplitValue>,        // Placeholder
+    renamed: SparseMap<Value, SplitValue>, // Placeholder
 }
 
 /// Context data structure that gets instantiated once per pass.
@@ -241,18 +239,25 @@ impl<'a> Context<'a> {
         }
 
         for renamed in self.renamed.as_slice() {
-            debug!("Renamed {} -> {:?}, {:?}", renamed.value, renamed.new_names, renamed.uses);
+            debug!(
+                "Renamed {} -> {:?}, {:?}",
+                renamed.value, renamed.new_names, renamed.uses
+            );
         }
 
         // Correcting the references and inserting phis
         for renamed in self.renamed.as_slice() {
             debug!("Renaming {}", renamed.value);
             for use_inst in &renamed.uses {
-                if let Some(new_defn) = self.find_redefinition_for_use(*use_inst,
-                                                                       &renamed.new_names) {
+                if let Some(new_defn) =
+                    self.find_redefinition_for_use(*use_inst, &renamed.new_names)
+                {
                     // Found a new definition, rename the first use in use_inst with a reference to
                     // this definition.
-                    debug!("Replace a use of {} with a use of {}", renamed.value, new_defn);
+                    debug!(
+                        "Replace a use of {} with a use of {}",
+                        renamed.value, new_defn
+                    );
                     for arg in self.cur.func.dfg.inst_args_mut(*use_inst) {
                         if *arg == renamed.value {
                             *arg = new_defn;
@@ -263,46 +268,65 @@ impl<'a> Context<'a> {
         }
     }
 
+    // Search for a redefinition in each ebb up the dominator tree from the use.  We may reach the
+    // top without finding anything.
+    //
+    // If the target ebb has a redefinition, then pick the latest such definition in the block,
+    // except that if the target ebb is the ebb with the use then pick the latest definition that
+    // precedes the use.
+    //
     // TODO: Compute the IDF and insert phis where required
     fn find_redefinition_for_use(&self, use_inst: Inst, new_names: &Vec<Value>) -> Option<Value> {
-        // For each block up the dominator tree from the use until we find a new definition
-        // or reach the top:
-        let mut target_ebb = self.cur.func.layout.inst_ebb(use_inst).expect("not in layout");
+        let use_pp = ExpandedProgramPoint::from(use_inst);
+        let mut target_ebb = self
+            .cur
+            .func
+            .layout
+            .inst_ebb(use_inst)
+            .expect("not in layout");
         let mut is_use_ebb = true;
-        let use_num = ExpandedProgramPoint::from(use_inst);
         let mut found = None;
         loop {
-            // If target_ebb has a definition for a new name of renamed.value, then pick the
-            // latest such definition in the block, or if target_ebb is the ebb with the
-            // use, the latest definition that precedes the use.
-            let mut max_defn_num_in_ebb = ExpandedProgramPoint::from(target_ebb);
+            let mut max_defn_pp = ExpandedProgramPoint::from(target_ebb);
             for new_defn in new_names {
-                let defn_inst = match self.cur.func.dfg.value_def(*new_defn) {
-                    ValueDef::Result(inst, _) => inst,
-                    ValueDef::Param(_, _) => {
-                        panic!("Not in layout");
+                let defn_inst = self.cur.func.dfg.value_def(*new_defn).unwrap_inst();
+                let defn_ebb = self
+                    .cur
+                    .func
+                    .layout
+                    .inst_ebb(defn_inst)
+                    .expect("not in layout");
+                let defn_pp = ExpandedProgramPoint::from(defn_inst);
+                if defn_ebb == target_ebb
+                    && (!is_use_ebb
+                        || self.cur.func.layout.cmp(defn_pp, use_pp) == cmp::Ordering::Less)
+                {
+                    if found.is_none()
+                        || self.cur.func.layout.cmp(max_defn_pp, defn_pp) == cmp::Ordering::Less
+                    {
+                        found = Some(*new_defn);
+                        max_defn_pp = defn_pp;
                     }
-                };
-                let defn_ebb = self.cur.func.layout.inst_ebb(defn_inst).expect("not in layout");
-                let defn_num = ExpandedProgramPoint::from(defn_inst);
-                if defn_ebb == target_ebb &&
-                    (!is_use_ebb || self.cur.func.layout.cmp(defn_num, use_num) == cmp::Ordering::Less) {
-                        if found.is_none() ||
-                            self.cur.func.layout.cmp(max_defn_num_in_ebb, defn_num) == cmp::Ordering::Less {
-                                found = Some(*new_defn);
-                                max_defn_num_in_ebb = defn_num;
-                            }
-                    }
+                }
             }
             if found.is_some() {
                 break;
             }
-            
+
             // Walk up the dominator tree to target_ebb's dominator.
             is_use_ebb = false;
             match self.domtree.idom(target_ebb) {
-                Some(idom) => target_ebb = self.cur.func.layout.inst_ebb(idom).expect("idom not in layout"),
-                None => { break; }
+                Some(idom) => {
+                    target_ebb = self
+                        .cur
+                        .func
+                        .layout
+                        .inst_ebb(idom)
+                        .expect("idom not in layout")
+                }
+                None => {
+                    break;
+                }
             }
         }
 
@@ -340,7 +364,8 @@ impl<'a> Context<'a> {
         self.cur.use_srcloc(inst);
 
         // Update the live value tracker with this instruction.
-        let (throughs, _kills, _defs) = tracker.process_inst(inst, &self.cur.func.dfg, self.liveness);
+        let (throughs, _kills, _defs) =
+            tracker.process_inst(inst, &self.cur.func.dfg, self.liveness);
 
         // If inst is a call, copy all register values that are live across the call into a temp
         // across the call, so that the temps can be spilled but the values themselves can stay in
