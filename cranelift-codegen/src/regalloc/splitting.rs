@@ -245,82 +245,68 @@ impl<'a> Context<'a> {
         }
 
         // Correcting the references and inserting phis
-        //
-        // For each variable v
-        //   For each instruction I that has a use U of v
-        //     [[ Note I can have multiple uses ]]
-        //     For each block B up the dominator tree from the block of U,
-        //       If B has a definition for a new name of v
-        //         Let W be the last such definition in B preceding U
-        //           [[ Note B could be the block of U and there could be several renames there ]]
-        //         Update I to reference W for each use in I
-        //
-        // The layout is a ProgramOrder and has a cmp() method that should allow us to compare
-        // instructions within an ebb at least.
-
-        // For each renamed value renamed.value:
         for renamed in self.renamed.as_slice() {
             debug!("Renaming {}", renamed.value);
-            // For each use of renamed.value:
             for use_inst in &renamed.uses {
-                debug!("  Use is {}", use_inst);
-                // For each block up the dominator tree from the use until we find a new definition
-                // or reach the top:
-                let mut target_ebb = self.cur.func.layout.inst_ebb(*use_inst).expect("not in layout");
-                debug!("  Target_ebb = {}", target_ebb);
-                let mut is_use_ebb = true;
-                let use_num = ExpandedProgramPoint::from(*use_inst);
-                let mut found = None;
-                loop {
-                    // If target_ebb has a definition for a new name of renamed.value, then pick the
-                    // latest such definition in the block, or if target_ebb is the ebb with the
-                    // use, the latest definition that precedes the use.
-                    let mut max_defn_num_in_ebb = ExpandedProgramPoint::from(target_ebb);
-                    for new_defn in &renamed.new_names {
-                        let defn_inst = match self.cur.func.dfg.value_def(*new_defn) {
-                            ValueDef::Result(inst, _) => inst,
-                            ValueDef::Param(_, _) => {
-                                panic!("Not in layout");
-                            }
-                        };
-                        let defn_ebb = self.cur.func.layout.inst_ebb(defn_inst).expect("not in layout");
-                        debug!("  Defn = {}, Defn_ebb = {}", defn_inst, defn_ebb);
-                        let defn_num = ExpandedProgramPoint::from(defn_inst);
-                        if defn_ebb == target_ebb &&
-                            (!is_use_ebb || self.cur.func.layout.cmp(defn_num, use_num) == cmp::Ordering::Less) {
-                                if found.is_none() ||
-                                    self.cur.func.layout.cmp(max_defn_num_in_ebb, defn_num) == cmp::Ordering::Less {
-                                found = Some(*new_defn);
-                                max_defn_num_in_ebb = defn_num;
-                            }
-                        }
-                    }
-                    if found.is_some() {
-                        break;
-                    }
-
-                    // Walk up the dominator tree to target_ebb's dominator.
-                    is_use_ebb = false;
-                    match self.domtree.idom(target_ebb) {
-                        Some(idom) => target_ebb = self.cur.func.layout.inst_ebb(idom).expect("idom not in layout"),
-                        None => { debug!("Failed to walk up"); break; }
-                    }
-                }
-
-                if let Some(new_defn) = found {
-                    // found a new definition, rename the first use in use_inst with
-                    // a reference to this definition
+                if let Some(new_defn) = self.find_redefinition_for_use(*use_inst,
+                                                                       &renamed.new_names) {
+                    // Found a new definition, rename the first use in use_inst with a reference to
+                    // this definition.
                     debug!("Replace a use of {} with a use of {}", renamed.value, new_defn);
                     for arg in self.cur.func.dfg.inst_args_mut(*use_inst) {
                         if *arg == renamed.value {
                             *arg = new_defn;
                         }
                     }
-                } else {
-                    debug!("No definition found");
                 }
             }
         }
+    }
+
+    // TODO: Compute the IDF and insert phis where required
+    fn find_redefinition_for_use(&self, use_inst: Inst, new_names: &Vec<Value>) -> Option<Value> {
+        // For each block up the dominator tree from the use until we find a new definition
+        // or reach the top:
+        let mut target_ebb = self.cur.func.layout.inst_ebb(use_inst).expect("not in layout");
+        let mut is_use_ebb = true;
+        let use_num = ExpandedProgramPoint::from(use_inst);
+        let mut found = None;
+        loop {
+            // If target_ebb has a definition for a new name of renamed.value, then pick the
+            // latest such definition in the block, or if target_ebb is the ebb with the
+            // use, the latest definition that precedes the use.
+            let mut max_defn_num_in_ebb = ExpandedProgramPoint::from(target_ebb);
+            for new_defn in new_names {
+                let defn_inst = match self.cur.func.dfg.value_def(*new_defn) {
+                    ValueDef::Result(inst, _) => inst,
+                    ValueDef::Param(_, _) => {
+                        panic!("Not in layout");
+                    }
+                };
+                let defn_ebb = self.cur.func.layout.inst_ebb(defn_inst).expect("not in layout");
+                let defn_num = ExpandedProgramPoint::from(defn_inst);
+                if defn_ebb == target_ebb &&
+                    (!is_use_ebb || self.cur.func.layout.cmp(defn_num, use_num) == cmp::Ordering::Less) {
+                        if found.is_none() ||
+                            self.cur.func.layout.cmp(max_defn_num_in_ebb, defn_num) == cmp::Ordering::Less {
+                                found = Some(*new_defn);
+                                max_defn_num_in_ebb = defn_num;
+                            }
+                    }
+            }
+            if found.is_some() {
+                break;
+            }
+            
+            // Walk up the dominator tree to target_ebb's dominator.
+            is_use_ebb = false;
+            match self.domtree.idom(target_ebb) {
+                Some(idom) => target_ebb = self.cur.func.layout.inst_ebb(idom).expect("idom not in layout"),
+                None => { break; }
+            }
+        }
+
+        found
     }
 
     fn ebb_insert_temps(&mut self, ebb: Ebb, tracker: &mut LiveValueTracker) {
