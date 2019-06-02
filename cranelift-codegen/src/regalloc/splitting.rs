@@ -278,32 +278,20 @@ impl<'a> Context<'a> {
     // TODO: Compute the IDF and insert phis where required
     fn find_redefinition_for_use(&self, use_inst: Inst, new_names: &Vec<Value>) -> Option<Value> {
         let use_pp = ExpandedProgramPoint::from(use_inst);
-        let mut target_ebb = self
-            .cur
-            .func
-            .layout
-            .inst_ebb(use_inst)
-            .expect("not in layout");
+        let layout = &self.cur.func.layout;
+        let mut target_ebb = layout.inst_ebb(use_inst).expect("not in layout");
         let mut is_use_ebb = true;
         let mut found = None;
         loop {
             let mut max_defn_pp = ExpandedProgramPoint::from(target_ebb);
             for new_defn in new_names {
                 let defn_inst = self.cur.func.dfg.value_def(*new_defn).unwrap_inst();
-                let defn_ebb = self
-                    .cur
-                    .func
-                    .layout
-                    .inst_ebb(defn_inst)
-                    .expect("not in layout");
+                let defn_ebb = layout.inst_ebb(defn_inst).expect("not in layout");
                 let defn_pp = ExpandedProgramPoint::from(defn_inst);
                 if defn_ebb == target_ebb
-                    && (!is_use_ebb
-                        || self.cur.func.layout.cmp(defn_pp, use_pp) == cmp::Ordering::Less)
+                    && (!is_use_ebb || layout.cmp(defn_pp, use_pp) == cmp::Ordering::Less)
                 {
-                    if found.is_none()
-                        || self.cur.func.layout.cmp(max_defn_pp, defn_pp) == cmp::Ordering::Less
-                    {
+                    if found.is_none() || layout.cmp(max_defn_pp, defn_pp) == cmp::Ordering::Less {
                         found = Some(*new_defn);
                         max_defn_pp = defn_pp;
                     }
@@ -317,12 +305,7 @@ impl<'a> Context<'a> {
             is_use_ebb = false;
             match self.domtree.idom(target_ebb) {
                 Some(idom) => {
-                    target_ebb = self
-                        .cur
-                        .func
-                        .layout
-                        .inst_ebb(idom)
-                        .expect("idom not in layout")
+                    target_ebb = layout.inst_ebb(idom).expect("idom not in layout");
                 }
                 None => {
                     break;
