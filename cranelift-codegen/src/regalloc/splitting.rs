@@ -167,6 +167,8 @@ impl SplitValue {
     }
 }
 
+type IDF = Vec<Ebb>;
+
 /// Persistent data structures for the splitting pass.
 pub struct Splitting {
     /// The `renamed` map has an entry for each original name whose live range is split and is keyed
@@ -248,9 +250,10 @@ impl<'a> Context<'a> {
         // Correcting the references and inserting phis
         for renamed in self.renamed.as_slice() {
             debug!("Renaming {}", renamed.value);
+            let idf = self.compute_idf(renamed.value, &renamed.new_names);
             for use_inst in &renamed.uses {
                 if let Some(new_defn) =
-                    self.find_redefinition_for_use(*use_inst, &renamed.new_names)
+                    self.find_redefinition(*use_inst, &renamed.new_names, &idf)
                 {
                     // Found a new definition, rename the first use in use_inst with a reference to
                     // this definition.
@@ -276,7 +279,7 @@ impl<'a> Context<'a> {
     // precedes the use.
     //
     // TODO: Compute the IDF and insert phis where required
-    fn find_redefinition_for_use(&self, use_inst: Inst, new_names: &Vec<Value>) -> Option<Value> {
+    fn find_redefinition(&self, use_inst: Inst, new_names: &Vec<Value>, idf: &IDF) -> Option<Value> {
         let use_pp = ExpandedProgramPoint::from(use_inst);
         let layout = &self.cur.func.layout;
         let mut target_ebb = layout.inst_ebb(use_inst).expect("not in layout");
@@ -302,6 +305,24 @@ impl<'a> Context<'a> {
             }
 
             // Walk up the dominator tree to target_ebb's dominator.
+            //
+            // TODO: If we cross the IDF, which is to say, target_ebb is in the IDF set and we
+            // succeed in walking up, then we must insert the old target_ebb into the set of Ebbs
+            // that needs phis.  For this we also need the original name (whatever we were renamed
+            // from).
+            //
+            // This is true even if we ultimately do not find a redefinition along the current path;
+            // that is a feature of the IDF.
+            //
+            // So:
+            // - IDF should be able to test for set/map membership
+            // - IDF is probably sparse (a small number of Ebbs per name)
+            // - We need a set of (name,Ebbs) that need phis
+            // - When we find an Ebb that needs a phi then this new phi will provide the redefinition
+            //   name we're looking for and the search will stop here (so we don't walk up after all)
+            // - It seems somewhat likely that the new redefinition will affect the IDF?  Or does the
+            //   IDF computation take that into account?
+
             is_use_ebb = false;
             match self.domtree.idom(target_ebb) {
                 Some(idom) => {
@@ -314,6 +335,10 @@ impl<'a> Context<'a> {
         }
 
         found
+    }
+
+    fn compute_idf(&self, name: Value, new_names: &Vec<Value>) -> IDF {
+        vec![]
     }
 
     fn ebb_insert_temps(&mut self, ebb: Ebb, tracker: &mut LiveValueTracker) {
