@@ -132,8 +132,9 @@
 
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
-use crate::entity::{SparseMap, SparseMapValue};
-use crate::ir::{Ebb, Function, Inst, InstBuilder, Value};
+use crate::entity::{SecondaryMap, SparseMap, SparseMapValue};
+use crate::flowgraph::ControlFlowGraph;
+use crate::ir::{Ebb, Function, Inst, InstBuilder, Value, ValueDef};
 use crate::ir::{ExpandedProgramPoint, ProgramOrder};
 use crate::isa::TargetIsa;
 use crate::regalloc::live_value_tracker::LiveValueTracker;
@@ -167,40 +168,105 @@ impl SplitValue {
     }
 }
 
-type IDF = Vec<Ebb>;
-
 /// Persistent data structures for the splitting pass.
 pub struct Splitting {
-    /// The `renamed` map has an entry for each original name whose live range is split and is keyed
-    /// on the original name.
-    renamed: SparseMap<Value, SplitValue>, // Placeholder
 }
 
 /// Context data structure that gets instantiated once per pass.
 struct Context<'a> {
     liveness: &'a Liveness,
 
-    renamed: &'a mut SparseMap<Value, SplitValue>,
-
     // Current instruction as well as reference to function and ISA.
     cur: EncCursor<'a>,
 
     // References to contextual data structures we need.
+    cfg: &'a ControlFlowGraph,
     domtree: &'a DominatorTree,
     topo: &'a mut TopoOrder,
 }
+
+type Renamed = SparseMap<Value, SplitValue>;
+
+/// Simple sparse set of Ebb values, currently just a dense vector.  We can do better but we want
+/// profiling data.  This is used for Dominance Frontiers, and they are normally quite small.
+#[derive(Clone, Debug)]
+struct SparseEbbSet {
+    dense: Vec<Ebb>
+}
+
+impl SparseEbbSet {
+    fn new() -> Self {
+        Self {
+            dense: vec![]
+        }
+    }
+
+    fn insert(&mut self, key: Ebb) {
+        if !self.contains_key(key) {
+            self.dense.push(key);
+        }
+    }
+
+    fn contains_key(&self, key: Ebb) -> bool {
+        for x in &self.dense {
+            if *x == key {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn iter(&self) -> SparseEbbSetIterator {
+        SparseEbbSetIterator {
+            dense: &self.dense,
+            next: 0
+        }
+    }
+}
+
+impl Default for SparseEbbSet {
+    fn default() -> Self {
+        SparseEbbSet::new()
+    }
+}
+
+impl<'a> IntoIterator for &'a SparseEbbSet {
+    type Item = Ebb;
+    type IntoIter = SparseEbbSetIterator<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+struct SparseEbbSetIterator<'a> {
+    dense: &'a Vec<Ebb>,
+    next: usize
+}
+
+impl<'a> Iterator for SparseEbbSetIterator<'a> {
+    type Item = Ebb;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.dense.len() {
+            None
+        } else {
+            let cur = self.next;
+            self.next += 1;
+            Some(self.dense[cur])
+        }
+    }
+}
+
+type IDF = SparseEbbSet;
 
 impl Splitting {
     /// Create a new splitting data structure.
     pub fn new() -> Self {
         Self {
-            renamed: SparseMap::new(),
         }
     }
 
     /// Clear all data structures in this splitting pass.
     pub fn clear(&mut self) {
-        self.renamed.clear();
     }
 
     /// Run the splitting algorithm over `func`.
@@ -208,6 +274,7 @@ impl Splitting {
         &mut self,
         isa: &TargetIsa,
         func: &mut Function,
+        cfg: &ControlFlowGraph,
         domtree: &DominatorTree,
         liveness: &Liveness,
         topo: &mut TopoOrder,
@@ -216,7 +283,7 @@ impl Splitting {
         debug!("Splitting across calls for:\n{}", func.display(isa));
         let mut ctx = Context {
             cur: EncCursor::new(func, isa),
-            renamed: &mut self.renamed,
+            cfg,
             domtree,
             liveness,
             topo,
@@ -227,42 +294,60 @@ impl Splitting {
 
 impl<'a> Context<'a> {
     fn run(&mut self) {
+        let mut renamed = Renamed::new();
+
         // Insert copy-to-temp before a call and copy-from-temp after a call, and retain information
         // about the values that were copied and the names created after the call in `renamed`.
         let mut tracker = LiveValueTracker::new();
         self.topo.reset(self.cur.func.layout.ebbs());
         while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
-            self.ebb_insert_temps(ebb, &mut tracker);
+            self.ebb_insert_temps(ebb, &mut renamed, &mut tracker);
         }
 
-        // Collect use information for all variables in `renamed`.
+        // Collect use information for all variables in `renamed`.  This will include newly inserted
+        // copies.
         for ebb in self.cur.func.layout.ebbs().collect::<Vec<Ebb>>() {
-            self.ebb_collect_uses(ebb);
+            self.ebb_collect_uses(ebb, &mut renamed);
         }
 
-        for renamed in self.renamed.as_slice() {
+        for renamed in renamed.as_slice() {
             debug!(
                 "Renamed {} -> {:?}, {:?}",
                 renamed.value, renamed.new_names, renamed.uses
             );
         }
 
-        // Correcting the references and inserting phis
-        for renamed in self.renamed.as_slice() {
-            debug!("Renaming {}", renamed.value);
-            let idf = self.compute_idf(renamed.value, &renamed.new_names);
-            for use_inst in &renamed.uses {
+        // We'll need the dominance frontiers for many nodes, so compute for all.  (Technically we
+        // need the DF for the nodes containing the old definition of a name and the new
+        // definitions, and it's possible we can compute them just for that set.)
+        let df = self.compute_df();
+
+        debug!("Dominance frontiers {:?}", df);
+
+        // TODO: This feels deeply wrong
+        let mut keys = vec![];
+        for renamed in renamed.into_iter() {
+            keys.push(renamed.value);
+        }
+
+        // Correct the references to renamed variables and insert phis if necessary.
+        for key in keys {
+            let r = renamed.get_mut(key).unwrap();
+            debug!("Renaming {}", r.value);
+            let idf = self.compute_idf(&df, r.value, &r.new_names);
+            debug!("  IDF {:?}", idf);
+            for use_inst in &r.uses {
                 if let Some(new_defn) =
-                    self.find_redefinition(*use_inst, &renamed.new_names, &idf)
+                    self.find_redefinition(*use_inst, r.value, &mut r.new_names, &idf)
                 {
                     // Found a new definition, rename the first use in use_inst with a reference to
                     // this definition.
                     debug!(
                         "Replace a use of {} with a use of {}",
-                        renamed.value, new_defn
+                        r.value, new_defn
                     );
                     for arg in self.cur.func.dfg.inst_args_mut(*use_inst) {
-                        if *arg == renamed.value {
+                        if *arg == r.value {
                             *arg = new_defn;
                         }
                     }
@@ -279,7 +364,7 @@ impl<'a> Context<'a> {
     // precedes the use.
     //
     // TODO: Compute the IDF and insert phis where required
-    fn find_redefinition(&self, use_inst: Inst, new_names: &Vec<Value>, idf: &IDF) -> Option<Value> {
+    fn find_redefinition(&self, use_inst: Inst, name: Value, new_names: &mut Vec<Value>, idf: &IDF) -> Option<Value> {
         let use_pp = ExpandedProgramPoint::from(use_inst);
         let layout = &self.cur.func.layout;
         let mut target_ebb = layout.inst_ebb(use_inst).expect("not in layout");
@@ -287,7 +372,7 @@ impl<'a> Context<'a> {
         let mut found = None;
         loop {
             let mut max_defn_pp = ExpandedProgramPoint::from(target_ebb);
-            for new_defn in new_names {
+            for new_defn in new_names.into_iter() {
                 let defn_inst = self.cur.func.dfg.value_def(*new_defn).unwrap_inst();
                 let defn_ebb = layout.inst_ebb(defn_inst).expect("not in layout");
                 let defn_pp = ExpandedProgramPoint::from(defn_inst);
@@ -320,8 +405,6 @@ impl<'a> Context<'a> {
             // - We need a set of (name,Ebbs) that need phis
             // - When we find an Ebb that needs a phi then this new phi will provide the redefinition
             //   name we're looking for and the search will stop here (so we don't walk up after all)
-            // - It seems somewhat likely that the new redefinition will affect the IDF?  Or does the
-            //   IDF computation take that into account?
 
             is_use_ebb = false;
             match self.domtree.idom(target_ebb) {
@@ -337,11 +420,67 @@ impl<'a> Context<'a> {
         found
     }
 
-    fn compute_idf(&self, name: Value, new_names: &Vec<Value>) -> IDF {
-        vec![]
+    // Compute the Dominance Frontier for all nodes.  See Cooper & Torczon, 1st Ed, 9.3.2.
+    fn compute_df(&self) -> SecondaryMap<Ebb, SparseEbbSet> {
+        let mut df = SecondaryMap::<Ebb, SparseEbbSet>::new();
+        for n in self.cur.func.layout.ebbs() {
+            // Ugly hack, we just want the number of predecessors first, and then we can iterate
+            // peacefully over the list.  And the pred_iter wraps the ebb in a BasicBlock and here
+            // we just strip it again; There Must Be A Better Way.
+            let preds: Vec<Ebb> = self.cfg.pred_iter(n).map(|bb| bb.ebb).collect();
+            if preds.len() >= 2 {
+                let idom_n = self.cur.func.layout.inst_ebb(self.domtree.idom(n).unwrap()).unwrap();
+                for p in preds {
+                    let mut runner = p;
+                    while runner != idom_n {
+                        df[runner].insert(n);
+                        runner = self.cur.func.layout.inst_ebb(self.domtree.idom(runner).unwrap()).unwrap();
+                    }
+                }
+            }
+        }
+        df
     }
 
-    fn ebb_insert_temps(&mut self, ebb: Ebb, tracker: &mut LiveValueTracker) {
+    // Compute the Iterated Dominance Frontier for the nodes containing the definitions of the name
+    // in question.  This is a straightforward worklist algorithm derived from Cytron et al 1991,
+    // the central fact is that DF(S) for a set S of nodes is the union of DF(x) across x in S.
+    fn compute_idf(&mut self, df:&SecondaryMap<Ebb, SparseEbbSet>, name: Value, new_names: &Vec<Value>) -> IDF {
+        let mut worklist = vec![];
+        worklist.push(self.defining_ebb(name));
+        for n in new_names {
+            worklist.push(self.defining_ebb(*n));
+        }
+
+        let mut in_worklist = SparseEbbSet::new();
+        for block in &worklist {
+            in_worklist.insert(*block);
+        }
+
+        let mut idf = SparseEbbSet::new();
+        while let Some(block) = worklist.pop() {
+            for dblock in &df[block] {
+                if !idf.contains_key(dblock) {
+                    idf.insert(dblock);
+                }
+                if !in_worklist.contains_key(dblock) {
+                    worklist.push(dblock);
+                }
+            }
+        }
+
+        idf
+    }
+
+    fn defining_ebb(&self, defn:Value) -> Ebb {
+        match self.cur.func.dfg.value_def(defn) {
+            ValueDef::Param(defn_ebb, _) => defn_ebb,
+            ValueDef::Result(defn_inst, _) => self.cur.func.layout.inst_ebb(defn_inst).unwrap()
+        }
+    }
+
+    fn ebb_insert_temps(&mut self, ebb: Ebb, renamed: &mut Renamed,
+                        tracker: &mut LiveValueTracker) {
         self.cur.goto_top(ebb);
         tracker.ebb_top(
             ebb,
@@ -356,7 +495,7 @@ impl<'a> Context<'a> {
         while let Some(inst) = self.cur.current_inst() {
             if !self.cur.func.dfg[inst].opcode().is_ghost() {
                 // visit_inst() applies the tracker and advances the instruction
-                self.inst_insert_temps(inst, ebb, tracker);
+                self.inst_insert_temps(inst, ebb, renamed, tracker);
             } else {
                 let (_throughs, _kills) = tracker.process_ghost(inst);
                 self.cur.next_inst();
@@ -365,7 +504,9 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn inst_insert_temps(&mut self, inst: Inst, ebb: Ebb, tracker: &mut LiveValueTracker) {
+    fn inst_insert_temps(&mut self, inst: Inst, ebb: Ebb, renamed: &mut Renamed,
+                         tracker: &mut LiveValueTracker)
+    {
         debug_assert_eq!(self.cur.current_inst(), Some(inst));
         debug_assert_eq!(self.cur.current_ebb(), Some(ebb));
 
@@ -408,12 +549,12 @@ impl<'a> Context<'a> {
                     i += 1;
                     let copy = self.cur.ins().copy(temp);
                     //let inst = self.cur.built_inst();
-                    if let Some(r) = self.renamed.get_mut(lv.value) {
+                    if let Some(r) = renamed.get_mut(lv.value) {
                         r.new_names.push(copy);
                     } else {
                         let mut r = SplitValue::new(lv.value);
                         r.new_names.push(copy);
-                        self.renamed.insert(r);
+                        renamed.insert(r);
                     }
                 }
             }
@@ -422,7 +563,7 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn ebb_collect_uses(&mut self, ebb: Ebb) {
+    fn ebb_collect_uses(&mut self, ebb: Ebb, renamed: &mut Renamed) {
         self.cur.goto_top(ebb);
         while let Some(inst) = self.cur.next_inst() {
             // Now inspect all the uses and if one is a Value defined in renamed, record this
@@ -434,7 +575,7 @@ impl<'a> Context<'a> {
             // new one.  On the other hand, that means multiple searches up the tree.  On the third
             // hand, how often is this an issue?
             for arg in self.cur.func.dfg.inst_args(inst) {
-                if let Some(info) = self.renamed.get_mut(*arg) {
+                if let Some(info) = renamed.get_mut(*arg) {
                     info.uses.push(inst);
                 }
             }
