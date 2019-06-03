@@ -50,85 +50,6 @@
 //
 //   S. Hack: Register Allocation for Programs in SSA Form, PhD Dissertation, University of
 //   Karlsruhe, 2006.
-//
-//
-// Algorithm.
-//
-// Step 0: Compute liveness using the standard Cranelift algorithm.
-//
-// This yields information needed by step 1.
-//
-//
-// Step 1: insert stack-allocated temps and collect information.
-//
-// Using the dominator tree and the live value tracker we can compute live-in sets for EBBs and
-// defs, kills, and throughs for each instruction.  We traverse the EBBs in top-down domtree order
-// and process instructions in each EBB in top-down order.
-//
-// REDEFINED = {}  // map from value -> value
-// EXITS = {}      // map from instruction -> (map from value -> value)
-// For each instruction I in top-down order
-//   for each use of a value U in I st. there is U -> X in REDEFINED,
-//     replace U by X in the instruction
-//   (DEFS, KILLS, THROUGHS) = analyze(I)
-//   if I is a call
-//     for each V in THROUGHS
-//       create a new variable S
-//       create a new variable R
-//       create a new instruction S <- copy V before the call
-//       create a new instruction R <- copy S after the call
-//       add V -> R to REDEFINED (this may remove an old mapping of V)
-//   if I is a branch or jump
-//     Add I -> immutable copy of REDEFINED to EXITS
-//
-// (This step follows the spilling pass almost exactly, just does more.)
-//
-//
-// Maybe: Maintain a set `Renamed` of tuples (v, D, U) where v is an original value that was
-// renamed and D is the instruction that defines it, and U is the empty set (it is given a
-// value in step 2).
-//
-//
-// Step 2: Collect use information
-//
-// Collect, for each use of (v, D, U) in Renamed, the set of instructions U that use v (ie
-// update the tuple for v in Renamed).
-//
-// (It's possible we need to collect definitions in an EBB that are not affected by renaming
-// but which are live-out.)
-//
-//
-// Step 3: Update SSA form
-//
-// Hack's dissertation has a plausible algorithm.  The sets of renamings that we have
-// provided will be used during the dominator tree search.
-//
-// For each variable v
-
-// TODO:
-//
-// - minimally we must compute the map { v -> U } for the uses of the original value v, where U
-//   is a set of instructions that use v (this could include new instructions).  We can do this
-//   in the same pass as copy insertion or we can make a separate pass.  If we do it in the same
-//   pass we must collect info for all variables and then filter the final set down to the ones
-//   that are renamed (which will likely be a smallish subset).  If we do it later it means a
-//   second traversal over the graph but we can collect info (and allocate data) only for the
-//   variables of interest, *and* it's not clear we must even use the live value tracker logic
-//   in this second pass so it may not be so bad.
-//
-// - for each original v, we must have a set D that is the set of instructions that define v or
-//   any of its renamings.  (possibly this should be broken down by ebb and sorted?)  For the
-//   renamings we must collect this during the copy insertion pass but for the originals we must
-//   either collect everything and then filter, or do a second pass.  We don't actually need
-//   the original in this set because the original will dominate any renaming and "not found" is
-//   a good proxy for the original definition.
-//
-// - for each instruction I we must have some way of getting from I to its EBB and to its
-//   sequence number within the EBB
-//
-// - so long as we search the dominator tree upwards and we can compare the ordering of two
-//   instructions within an EBB we can find the latest (re)definition of a variable in
-//   an ebb
 
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
@@ -363,7 +284,7 @@ impl<'a> Context<'a> {
     // except that if the target ebb is the ebb with the use then pick the latest definition that
     // precedes the use.
     //
-    // TODO: Compute the IDF and insert phis where required
+    // TODO: insert phis where required
     fn find_redefinition(&self, use_inst: Inst, name: Value, new_names: &mut Vec<Value>, idf: &IDF) -> Option<Value> {
         let use_pp = ExpandedProgramPoint::from(use_inst);
         let layout = &self.cur.func.layout;
@@ -396,8 +317,22 @@ impl<'a> Context<'a> {
             // that needs phis.  For this we also need the original name (whatever we were renamed
             // from).
             //
-            // This is true even if we ultimately do not find a redefinition along the current path;
-            // that is a feature of the IDF.
+            // (This is true even if we ultimately do not find a redefinition along the current
+            // path; that is a feature of the IDF.)
+            //
+            // When we create the phi we also create a new name, and that is the name that we must
+            // return from this function, and I'm strongly inclined to say that we must insert the
+            // name into new_names so that subsequent uses in the same area will find the same
+            // definition.  Since we're on the IDF, we don't need to do anything more.
+            //
+            // How do we track phi insertion?
+            //
+            //   - we're going to add a new parameter to the ebb, this is a new name `zappa`
+            //   - for each of the predecessors' outgoing edges to this block, we're going to
+            //     pass a value in the position of `zappa`.  this value is not necessarily the
+            //     original name, but the name of the most recent definition in *that* position.
+            //     this seems to invoke renaming / phi insertion recursively, and it may mean
+            //     that "phi insertion" happens right here, not in a subsequent pass.
             //
             // So:
             // - IDF should be able to test for set/map membership
