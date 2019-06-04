@@ -327,12 +327,20 @@ impl<'a> Context<'a> {
             //
             // How do we track phi insertion?
             //
-            //   - we're going to add a new parameter to the ebb, this is a new name `zappa`
-            //   - for each of the predecessors' outgoing edges to this block, we're going to
-            //     pass a value in the position of `zappa`.  this value is not necessarily the
-            //     original name, but the name of the most recent definition in *that* position.
-            //     this seems to invoke renaming / phi insertion recursively, and it may mean
-            //     that "phi insertion" happens right here, not in a subsequent pass.
+            //   - we're going to add a new parameter to the ebb, this is a new name `zappa7` if we
+            //     were looking for the original value `zappa`
+            //
+            //   - for each of the predecessors' outgoing edges to this block, we're going to pass a
+            //     value in the position of `zappa7`.  That value is not necessarily `zappa`, but
+            //     the name of the most recent definition counting from the outgoing edge.  this
+            //     seems to invoke renaming / phi insertion recursively, and it may mean that "phi
+            //     insertion" must happen right here, not in a subsequent pass.
+            //
+            //   - in our setup we don't have phis quite in the same way, so "inserting a phi" is
+            //     the double action of adding a param and adding outgoing values
+            //
+            //   - those outgoing values then become uses in the predecessor blocks; this is maybe
+            //     the phantom use instruction that I've seen in some papers
             //
             // So:
             // - IDF should be able to test for set/map membership
