@@ -54,7 +54,7 @@
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
 use crate::entity::{SecondaryMap, SparseMap, SparseMapValue};
-use crate::flowgraph::ControlFlowGraph;
+use crate::flowgraph::{BasicBlock, ControlFlowGraph};
 use crate::ir::{Ebb, Function, Inst, InstBuilder, Value, ValueDef};
 use crate::ir::{ExpandedProgramPoint, ProgramOrder};
 use crate::isa::TargetIsa;
@@ -62,7 +62,7 @@ use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::regalloc::liveness::Liveness;
 use crate::timing;
 use crate::topo_order::TopoOrder;
-use core::cmp;
+use core::cmp::Ordering;
 use log::debug;
 use std::vec::Vec;
 
@@ -89,6 +89,8 @@ impl SplitValue {
     }
 }
 
+type Renamed = SparseMap<Value, SplitValue>;
+
 /// Persistent data structures for the splitting pass.
 pub struct Splitting {
 }
@@ -105,8 +107,6 @@ struct Context<'a> {
     domtree: &'a DominatorTree,
     topo: &'a mut TopoOrder,
 }
-
-type Renamed = SparseMap<Value, SplitValue>;
 
 /// Simple sparse set of Ebb values, currently just a dense vector.  We can do better but we want
 /// profiling data.  This is used for Dominance Frontiers, and they are normally quite small.
@@ -257,21 +257,29 @@ impl<'a> Context<'a> {
             debug!("Renaming {}", r.value);
             let idf = self.compute_idf(&df, r.value, &r.new_names);
             debug!("  IDF {:?}", idf);
-            for use_inst in &r.uses {
-                if let Some(new_defn) =
-                    self.find_redefinition(*use_inst, r.value, &mut r.new_names, &idf)
-                {
+            let mut worklist = r.uses.clone(); // Really we should be able to just own this...
+            let mut i = 0;
+            while i < worklist.len() {
+                let use_inst = worklist[i];
+                i += 1;
+                let (found, inserted) =
+                    self.find_redefinition(use_inst, r.value, &r.new_names, &idf);
+                if let Some(new_defn) = found {
                     // Found a new definition, rename the first use in use_inst with a reference to
                     // this definition.
                     debug!(
                         "Replace a use of {} with a use of {}",
                         r.value, new_defn
                     );
-                    for arg in self.cur.func.dfg.inst_args_mut(*use_inst) {
+                    for arg in self.cur.func.dfg.inst_args_mut(use_inst) {
                         if *arg == r.value {
                             *arg = new_defn;
                         }
                     }
+                }
+                if let Some((phi_name, mut new_uses)) = inserted {
+                    r.new_names.push(phi_name);
+                    worklist.append(&mut new_uses);
                 }
             }
         }
@@ -284,86 +292,91 @@ impl<'a> Context<'a> {
     // except that if the target ebb is the ebb with the use then pick the latest definition that
     // precedes the use.
     //
-    // TODO: insert phis where required
-    fn find_redefinition(&self, use_inst: Inst, name: Value, new_names: &mut Vec<Value>, idf: &IDF) -> Option<Value> {
-        let use_pp = ExpandedProgramPoint::from(use_inst);
+    // If the target ebb is in the iterated dominance frontier for the original name and does not
+    // otherwise have a redefinition, then we insert a phi in the target ebb to act as a
+    // redefinition, and we return the name defined by the phi.  Inserting a phi also adds uses of
+    // the original name to all predecessor blocks, so they become new uses.
+    //
+    // Thus we return a triple: the redefinition we've chosen; optionally a new
+    // definition; and optionally new uses for the original name in predecessor blocks.
+
+    fn find_redefinition(&mut self, use_inst: Inst, name: Value, new_names: &Vec<Value>, idf: &IDF)
+                         -> (Option<Value>, Option<(Value, Vec<Inst>)>) {
         let layout = &self.cur.func.layout;
+        let dfg = &mut self.cur.func.dfg;
+
+        let use_pp = ExpandedProgramPoint::from(use_inst);
+        let use_ebb = layout.inst_ebb(use_inst).unwrap();
+
         let mut target_ebb = layout.inst_ebb(use_inst).expect("not in layout");
-        let mut is_use_ebb = true;
         let mut found = None;
+        let mut phi_info = None;
+
+        'find_closest_defn:
         loop {
+            // Search target_ebb for the closest preceding definition (if target_ebb == use_ebb), or
+            // the last definition (otherwise).
+
             let mut max_defn_pp = ExpandedProgramPoint::from(target_ebb);
             for new_defn in new_names.into_iter() {
-                let defn_inst = self.cur.func.dfg.value_def(*new_defn).unwrap_inst();
-                let defn_ebb = layout.inst_ebb(defn_inst).expect("not in layout");
-                let defn_pp = ExpandedProgramPoint::from(defn_inst);
-                if defn_ebb == target_ebb
-                    && (!is_use_ebb || layout.cmp(defn_pp, use_pp) == cmp::Ordering::Less)
-                {
-                    if found.is_none() || layout.cmp(max_defn_pp, defn_pp) == cmp::Ordering::Less {
+                let (defn_ebb, defn_pp) = match dfg.value_def(*new_defn) {
+                    ValueDef::Result(defn_inst, _) =>
+                        (layout.inst_ebb(defn_inst).unwrap(),
+                         ExpandedProgramPoint::from(defn_inst)),
+                    ValueDef::Param(defn_ebb, _) =>
+                        (defn_ebb, ExpandedProgramPoint::from(defn_ebb))
+                };
+
+                if defn_ebb != target_ebb {
+                    continue;
+                }
+
+                if target_ebb != use_ebb || layout.cmp(defn_pp, use_pp) == Ordering::Less {
+                    if found.is_none() || layout.cmp(max_defn_pp, defn_pp) == Ordering::Less {
                         found = Some(*new_defn);
                         max_defn_pp = defn_pp;
                     }
                 }
             }
+
+            // If we found a definition we're done.
+
             if found.is_some() {
-                break;
+                break 'find_closest_defn;
             }
 
-            // Walk up the dominator tree to target_ebb's dominator.
-            //
-            // TODO: If we cross the IDF, which is to say, target_ebb is in the IDF set and we
-            // succeed in walking up, then we must insert the old target_ebb into the set of Ebbs
-            // that needs phis.  For this we also need the original name (whatever we were renamed
-            // from).
-            //
-            // (This is true even if we ultimately do not find a redefinition along the current
-            // path; that is a feature of the IDF.)
-            //
-            // When we create the phi we also create a new name, and that is the name that we must
-            // return from this function, and I'm strongly inclined to say that we must insert the
-            // name into new_names so that subsequent uses in the same area will find the same
-            // definition.  Since we're on the IDF, we don't need to do anything more.
-            //
-            // How do we track phi insertion?
-            //
-            //   - we're going to add a new parameter to the ebb, this is a new name `zappa7` if we
-            //     were looking for the original value `zappa`
-            //
-            //   - for each of the predecessors' outgoing edges to this block, we're going to pass a
-            //     value in the position of `zappa7`.  That value is not necessarily `zappa`, but
-            //     the name of the most recent definition counting from the outgoing edge.  this
-            //     seems to invoke renaming / phi insertion recursively, and it may mean that "phi
-            //     insertion" must happen right here, not in a subsequent pass.
-            //
-            //   - in our setup we don't have phis quite in the same way, so "inserting a phi" is
-            //     the double action of adding a param and adding outgoing values
-            //
-            //   - those outgoing values then become uses in the predecessor blocks; this is maybe
-            //     the phantom use instruction that I've seen in some papers
-            //
-            // So:
-            // - IDF should be able to test for set/map membership
-            // - IDF is probably sparse (a small number of Ebbs per name)
-            // - We need a set of (name,Ebbs) that need phis
-            // - When we find an Ebb that needs a phi then this new phi will provide the redefinition
-            //   name we're looking for and the search will stop here (so we don't walk up after all)
+            // The target_ebb had no definition.  If there's a dominator, then either target_ebb is
+            // in the IDF of `name` and we must insert a phi (and use this phi as our result), or we
+            // walk up to target_ebb's immediate dominator and search there.
 
-            is_use_ebb = false;
             match self.domtree.idom(target_ebb) {
-                Some(idom) => {
-                    target_ebb = layout.inst_ebb(idom).expect("idom not in layout");
-                }
                 None => {
-                    break;
+                    break 'find_closest_defn;
+                }
+                Some(idom) => {
+                    if idf.contains_key(target_ebb) {
+                        let phi_name = dfg.append_ebb_param(target_ebb, dfg.value_type(name));
+                        let mut new_uses = vec![];
+                        for BasicBlock { inst, .. } in self.cfg.pred_iter(target_ebb) {
+                            dfg.append_inst_arg(inst, name);
+                            new_uses.push(inst);
+                        }
+                        phi_info = Some((phi_name, new_uses));
+                        break 'find_closest_defn;
+                    } else {
+                        target_ebb = layout.inst_ebb(idom).expect("idom not in layout");
+                    }
                 }
             }
         }
 
-        found
+        (found, phi_info)
     }
 
-    // Compute the Dominance Frontier for all nodes.  See Cooper & Torczon, 1st Ed, 9.3.2.
+    // Compute the Dominance Frontier for all nodes.  Taken from:
+    //
+    //   Keith D. Cooper and Linda Torczon, Engineering a Compiler, 1st Ed, sect 9.3.2.
+
     fn compute_df(&self) -> SecondaryMap<Ebb, SparseEbbSet> {
         let mut df = SecondaryMap::<Ebb, SparseEbbSet>::new();
         for n in self.cur.func.layout.ebbs() {
@@ -386,8 +399,12 @@ impl<'a> Context<'a> {
     }
 
     // Compute the Iterated Dominance Frontier for the nodes containing the definitions of the name
-    // in question.  This is a straightforward worklist algorithm derived from Cytron et al 1991,
-    // the central fact is that DF(S) for a set S of nodes is the union of DF(x) across x in S.
+    // in question.  This is a straightforward worklist algorithm, the central fact is that DF(S)
+    // for a set S of nodes is the union of DF(x) across x in S.  See:
+    //
+    //   Ron Cytron, Jeanne Ferrante, Barry K Rosen and Mark N Wegman, Efficiently Computing Static
+    //   Single Assignment Form and the Control Dependence Graph, ACM TOPLAS vol 13, no 4, Oct 1991.
+
     fn compute_idf(&mut self, df:&SecondaryMap<Ebb, SparseEbbSet>, name: Value, new_names: &Vec<Value>) -> IDF {
         let mut worklist = vec![];
         worklist.push(self.defining_ebb(name));
