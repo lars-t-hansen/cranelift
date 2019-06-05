@@ -216,20 +216,8 @@ impl Splitting {
 impl<'a> Context<'a> {
     fn run(&mut self) {
         let mut renamed = Renamed::new();
-
-        // Insert copy-to-temp before a call and copy-from-temp after a call, and retain information
-        // about the values that were copied and the names created after the call in `renamed`.
-        let mut tracker = LiveValueTracker::new();
-        self.topo.reset(self.cur.func.layout.ebbs());
-        while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
-            self.ebb_insert_temps(ebb, &mut renamed, &mut tracker);
-        }
-
-        // Collect use information for all variables in `renamed`.  This will include newly inserted
-        // copies.
-        for ebb in self.cur.func.layout.ebbs().collect::<Vec<Ebb>>() {
-            self.ebb_collect_uses(ebb, &mut renamed);
-        }
+        self.insert_temps(&mut renamed);
+        self.collect_uses(&mut renamed);
 
         for renamed in renamed.as_slice() {
             debug!(
@@ -238,13 +226,14 @@ impl<'a> Context<'a> {
             );
         }
 
-        // We'll need the dominance frontiers for many nodes, so compute for all.  (Technically we
-        // need the DF for the nodes containing the old definition of a name and the new
-        // definitions, and it's possible we can compute them just for that set.)
         let df = self.compute_df();
 
         debug!("Dominance frontiers {:?}", df);
 
+        self.rename_uses(&df, &mut renamed);
+    }
+
+    fn rename_uses(&mut self, df: &SecondaryMap<Ebb, SparseEbbSet>, renamed: &mut Renamed) {
         // TODO: This feels deeply wrong
         let mut keys = vec![];
         for renamed in renamed.into_iter() {
@@ -255,7 +244,7 @@ impl<'a> Context<'a> {
         for key in keys {
             let r = renamed.get_mut(key).unwrap();
             debug!("Renaming {}", r.value);
-            let idf = self.compute_idf(&df, r.value, &r.new_names);
+            let idf = self.compute_idf(df, r.value, &r.new_names);
             debug!("  IDF {:?}", idf);
             let mut worklist = r.uses.clone(); // Really we should be able to just own this...
             let mut i = 0;
@@ -361,6 +350,7 @@ impl<'a> Context<'a> {
                             dfg.append_inst_arg(inst, name);
                             new_uses.push(inst);
                         }
+                        found = Some(phi_name);
                         phi_info = Some((phi_name, new_uses));
                         break 'find_closest_defn;
                     } else {
@@ -376,9 +366,64 @@ impl<'a> Context<'a> {
     // Compute the Dominance Frontier for all nodes.  Taken from:
     //
     //   Keith D. Cooper and Linda Torczon, Engineering a Compiler, 1st Ed, sect 9.3.2.
+    //
+    // FIXME: This may not be correct for EBBs with side exits?
+
+    /*
+
+Here ebb2 is the join point.  Its idom is ebb0.  It has 2 predecessors, ebb3 and ebb5.  But only the
+first part of ebb0 is the idom of ebb2, the second part of ebb0 is not.  This is a bit of a mess.
+
+The value returned from the idom() function actually encodes this by representing the idom as
+the control flow instruction, that is, the idom of ebb2 is the brz.  Then we make a mistake by
+mapping that instruction to its ebb.
+
+In the case of the definition search, there may be a risk that we find a definition that is past the
+CFI that terminates the BB.  So that has to be fixed too.
+
+But for the DF computation, we can't use EBBs like we do - it's just wrong.  We need to use BBs somehow.
+
+A BB is thus a linear range of instructions within an ebb, but if the ebb can have multiple side
+exits there can be more than two BBs.  It's uncertain what the idom computation does about that; we
+need to investigate.  It should return the preceding range in the same ebb.
+
+                                ebb0(v0: i32, v1: i64):
+                                    v10 -> v0
+@0044 [RexOp1tjccb#74]              brz v0, ebb4
+@0048 [Op1call_id#e8]               v12 = call fn0(v1)
+@0048 [null#00]                     v5 = ireduce.i32 v12
+@004c [RexOp1rr#01]                 v6 = iadd v5, v0
+@004d [Op1jmpb#eb]                  jump ebb3(v6)
+
+                                ebb3(v4: i32):
+@004e [Op1jmpb#eb]                  jump ebb2(v4)
+
+                                ebb4:
+@0055 [RexOp1r_ib#83]               v9 = iadd_imm.i32 v0, 1
+@0056 [Op1jmpb#eb]                  jump ebb5(v9)
+
+                                ebb5(v7: i32):
+@0057 [Op1jmpb#eb]                  jump ebb2(v7)
+
+                                ebb2(v3: i32):
+@005a [RexOp1rr#01]                 v11 = iadd v3, v0
+@005b [Op1jmpb#eb]                  jump ebb1(v11)
+
+                                ebb1(v2: i32):
+@005b [RexOp1umr#89]                v13 = uextend.i64 v2
+@005b [-]                           fallthrough_return v13
+
+     */
+    
+    //But the tail only has one predecessor.
+    //
+    // FIXME: does this affect the idom walk when we look for a definition too?
 
     fn compute_df(&self) -> SecondaryMap<Ebb, SparseEbbSet> {
         let mut df = SecondaryMap::<Ebb, SparseEbbSet>::new();
+
+        // EBB NOT OK HERE
+
         for n in self.cur.func.layout.ebbs() {
             // Ugly hack, we just want the number of predecessors first, and then we can iterate
             // peacefully over the list.  And the pred_iter wraps the ebb in a BasicBlock and here
@@ -407,24 +452,35 @@ impl<'a> Context<'a> {
 
     fn compute_idf(&mut self, df:&SecondaryMap<Ebb, SparseEbbSet>, name: Value, new_names: &Vec<Value>) -> IDF {
         let mut worklist = vec![];
-        worklist.push(self.defining_ebb(name));
-        for n in new_names {
-            worklist.push(self.defining_ebb(*n));
-        }
-
         let mut in_worklist = SparseEbbSet::new();
-        for block in &worklist {
-            in_worklist.insert(*block);
+
+        // EBB NOT OK HERE
+
+        {
+            let start = self.defining_ebb(name);
+            worklist.push(start);
+            in_worklist.insert(start);
+        }
+        for n in new_names {
+            debug!("  New name {}", *n);
+            let block = self.defining_ebb(*n);
+            if !in_worklist.contains_key(block) {
+                worklist.push(block);
+                in_worklist.insert(block);
+            }
         }
 
+        debug!("  Worklist {:?}", worklist);
         let mut idf = SparseEbbSet::new();
         while let Some(block) = worklist.pop() {
+            debug!("  Processing {}", block);
             for dblock in &df[block] {
                 if !idf.contains_key(dblock) {
                     idf.insert(dblock);
                 }
                 if !in_worklist.contains_key(dblock) {
                     worklist.push(dblock);
+                    in_worklist.insert(dblock);
                 }
             }
         }
@@ -432,10 +488,27 @@ impl<'a> Context<'a> {
         idf
     }
 
+    // EBB NOT OK HERE
+
     fn defining_ebb(&self, defn:Value) -> Ebb {
         match self.cur.func.dfg.value_def(defn) {
             ValueDef::Param(defn_ebb, _) => defn_ebb,
             ValueDef::Result(defn_inst, _) => self.cur.func.layout.inst_ebb(defn_inst).unwrap()
+        }
+    }
+
+
+    // Insert copy-to-temp before a call and copy-from-temp after a call, and retain information
+    // about the values that were copied and the names created after the call in `renamed`.
+
+    fn insert_temps(&mut self, renamed: &mut Renamed) {
+        // EBB OK HERE
+        let mut tracker = LiveValueTracker::new();
+
+        // Topo-ordered traversal is required because we track liveness precisely.
+        self.topo.reset(self.cur.func.layout.ebbs());
+        while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
+            self.ebb_insert_temps(ebb, renamed, &mut tracker);
         }
     }
 
@@ -520,6 +593,16 @@ impl<'a> Context<'a> {
             }
         } else {
             self.cur.next_inst();
+        }
+    }
+
+    // Collect use information for all variables in `renamed`.  This will include newly inserted
+    // copies.
+
+    fn collect_uses(&mut self, renamed: &mut Renamed) {
+        // EBB OK HERE
+        for ebb in self.cur.func.layout.ebbs().collect::<Vec<Ebb>>() {
+            self.ebb_collect_uses(ebb, renamed);
         }
     }
 
