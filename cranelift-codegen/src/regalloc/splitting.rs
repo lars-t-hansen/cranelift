@@ -51,12 +51,59 @@
 //   S. Hack: Register Allocation for Programs in SSA Form, PhD Dissertation, University of
 //   Karlsruhe, 2006.
 
+/*  FIXME: Note this
+
+Here ebb2 is the join point.  Its idom is ebb0.  It has 2 predecessors, ebb3 and ebb5.  But only the
+first part of ebb0 is the idom of ebb2, the second part of ebb0 is not.  This is a bit of a mess.
+
+The value returned from the idom() function actually encodes this by representing the idom as
+the control flow instruction, that is, the idom of ebb2 is the brz.  Then we make a mistake by
+mapping that instruction to its ebb.
+
+In the case of the definition search, there may be a risk that we find a definition that is past the
+CFI that terminates the BB.  So that has to be fixed too.
+
+But for the DF computation, we can't use EBBs like we do - it's just wrong.  We need to use BBs somehow.
+
+A BB is thus a linear range of instructions within an ebb, but if the ebb can have multiple side
+exits there can be more than two BBs.  It's uncertain what the idom computation does about that; we
+need to investigate.  It should return the preceding range in the same ebb.
+
+                                ebb0(v0: i32, v1: i64):
+                                    v10 -> v0
+@0044 [RexOp1tjccb#74]              brz v0, ebb4
+@0048 [Op1call_id#e8]               v12 = call fn0(v1)
+@0048 [null#00]                     v5 = ireduce.i32 v12
+@004c [RexOp1rr#01]                 v6 = iadd v5, v0
+@004d [Op1jmpb#eb]                  jump ebb3(v6)
+
+                                ebb3(v4: i32):
+@004e [Op1jmpb#eb]                  jump ebb2(v4)
+
+                                ebb4:
+@0055 [RexOp1r_ib#83]               v9 = iadd_imm.i32 v0, 1
+@0056 [Op1jmpb#eb]                  jump ebb5(v9)
+
+                                ebb5(v7: i32):
+@0057 [Op1jmpb#eb]                  jump ebb2(v7)
+
+                                ebb2(v3: i32):
+@005a [RexOp1rr#01]                 v11 = iadd v3, v0
+@005b [Op1jmpb#eb]                  jump ebb1(v11)
+
+                                ebb1(v2: i32):
+@005b [RexOp1umr#89]                v13 = uextend.i64 v2
+@005b [-]                           fallthrough_return v13
+
+     */
+
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
 use crate::entity::{SecondaryMap, SparseMap, SparseMapValue};
 use crate::flowgraph::{BasicBlock, ControlFlowGraph};
 use crate::ir::{Ebb, Function, Inst, InstBuilder, Value, ValueDef};
 use crate::ir::{ExpandedProgramPoint, ProgramOrder};
+use crate::ir::instructions::BranchInfo;
 use crate::isa::TargetIsa;
 use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::regalloc::liveness::Liveness;
@@ -66,22 +113,22 @@ use core::cmp::Ordering;
 use log::debug;
 use std::vec::Vec;
 
-/// Tracks a value and its uses, and its new names.
-struct SplitValue {
+/// Tracks a renamed value, its uses, and its new names.
+struct RenamedValue {
     value: Value,
     new_names: Vec<Value>,
     uses: Vec<Inst>,
 }
 
-impl SparseMapValue<Value> for SplitValue {
+impl SparseMapValue<Value> for RenamedValue {
     fn key(&self) -> Value {
         self.value
     }
 }
 
-impl SplitValue {
+impl RenamedValue {
     fn new(value: Value) -> Self {
-        Self {
+        RenamedValue {
             value,
             new_names: vec![],
             uses: vec![],
@@ -89,46 +136,34 @@ impl SplitValue {
     }
 }
 
-type Renamed = SparseMap<Value, SplitValue>;
+/// A map from the original names to information about their renamings.
+type Renamed = SparseMap<Value, RenamedValue>;
 
-/// Persistent data structures for the splitting pass.
-pub struct Splitting {
-}
-
-/// Context data structure that gets instantiated once per pass.
-struct Context<'a> {
-    liveness: &'a Liveness,
-
-    // Current instruction as well as reference to function and ISA.
-    cur: EncCursor<'a>,
-
-    // References to contextual data structures we need.
-    cfg: &'a ControlFlowGraph,
-    domtree: &'a DominatorTree,
-    topo: &'a mut TopoOrder,
-}
-
-/// Simple sparse set of Ebb values, currently just a dense vector.  We can do better but we want
-/// profiling data.  This is used for Dominance Frontiers, and they are normally quite small.
+/// Sparse set of BB values.
 #[derive(Clone, Debug)]
-struct SparseEbbSet {
-    dense: Vec<Ebb>
+struct SparseBBSet {
+    /// Just a dense vector.  We can do better but we want profiling data.  This is used for
+    /// Dominance Frontiers and worklist marking sets, and they are normally quite small.
+    dense: Vec<BB>
 }
 
-impl SparseEbbSet {
+impl SparseBBSet {
+    /// Create an empty set.
     fn new() -> Self {
         Self {
             dense: vec![]
         }
     }
 
-    fn insert(&mut self, key: Ebb) {
+    /// Insert the key into the set, does nothing if the key is already present.
+    fn insert(&mut self, key: BB) {
         if !self.contains_key(key) {
             self.dense.push(key);
         }
     }
 
-    fn contains_key(&self, key: Ebb) -> bool {
+    /// Test whether the key is in the set.
+    fn contains_key(&self, key: BB) -> bool {
         for x in &self.dense {
             if *x == key {
                 return true;
@@ -137,35 +172,36 @@ impl SparseEbbSet {
         return false;
     }
 
-    fn iter(&self) -> SparseEbbSetIterator {
-        SparseEbbSetIterator {
+    /// Create an iterator over the set.
+    fn iter(&self) -> SparseBBSetIterator {
+        SparseBBSetIterator {
             dense: &self.dense,
             next: 0
         }
     }
 }
 
-impl Default for SparseEbbSet {
+impl Default for SparseBBSet {
     fn default() -> Self {
-        SparseEbbSet::new()
+        SparseBBSet::new()
     }
 }
 
-impl<'a> IntoIterator for &'a SparseEbbSet {
-    type Item = Ebb;
-    type IntoIter = SparseEbbSetIterator<'a>;
+impl<'a> IntoIterator for &'a SparseBBSet {
+    type Item = BB;
+    type IntoIter = SparseBBSetIterator<'a>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
 
-struct SparseEbbSetIterator<'a> {
-    dense: &'a Vec<Ebb>,
+struct SparseBBSetIterator<'a> {
+    dense: &'a Vec<BB>,
     next: usize
 }
 
-impl<'a> Iterator for SparseEbbSetIterator<'a> {
-    type Item = Ebb;
+impl<'a> Iterator for SparseBBSetIterator<'a> {
+    type Item = BB;
     fn next(&mut self) -> Option<Self::Item> {
         if self.next == self.dense.len() {
             None
@@ -177,8 +213,39 @@ impl<'a> Iterator for SparseEbbSetIterator<'a> {
     }
 }
 
-type IDF = SparseEbbSet;
-type AllDF = SecondaryMap<Ebb, SparseEbbSet>;
+// A basic block (BB) is represented as the control transfer instruction within an Ebb that ends the
+// BB.  Given a BB we can map it to its containing Ebb using layout.inst_ebb(), and then we can find
+// the relative position of the BB within the Ebb by scanning the information associated with the
+// Ebb.
+//
+// At the non-first BB in an Ebb:
+// - its idom is the preceding BB in the Ebb
+// - its only predecessor is the preceding BB in the Ebb
+//
+// At the first BB in an Ebb:
+// - the domtree.idom() method is applied to the Ebb and yields the BB that is the idom
+// - the cfg.pred_iter() method is applied to the Ebb and yields the BBs that are the predecessors
+
+type BB = Inst;
+
+struct BBGraph {
+    info: SecondaryMap<Ebb, Vec<BB>>
+}
+
+impl<'a> BBGraph {
+    fn new() -> Self {
+        Self {
+            info: SecondaryMap::new()
+        }
+    }
+}
+
+type IDF = SparseBBSet;
+type AllDF = SecondaryMap<BB, SparseBBSet>;
+
+/// Persistent data structures for the splitting pass.
+pub struct Splitting {
+}
 
 impl Splitting {
     /// Create a new splitting data structure.
@@ -204,6 +271,7 @@ impl Splitting {
         let _tt = timing::ra_splitting();
         debug!("Splitting across calls for:\n{}", func.display(isa));
         let mut ctx = Context {
+            bbgraph: BBGraph::new(),
             cur: EncCursor::new(func, isa),
             cfg,
             domtree,
@@ -214,12 +282,29 @@ impl Splitting {
     }
 }
 
+/// Context data structure that gets instantiated once per pass.
+struct Context<'a> {
+    bbgraph: BBGraph,
+
+    liveness: &'a Liveness,
+
+    // Current instruction as well as reference to function and ISA.
+    cur: EncCursor<'a>,
+
+    // References to contextual data structures we need.
+    cfg: &'a ControlFlowGraph,
+    domtree: &'a DominatorTree,
+    topo: &'a mut TopoOrder,
+}
+
 impl<'a> Context<'a> {
     fn run(&mut self) {
         let mut renamed = Renamed::new();
 
+        let ebbs = self.cur.func.layout.ebbs().collect::<Vec<Ebb>>();
+
         self.insert_temps(&mut renamed);
-        self.collect_uses(&mut renamed);
+        self.collect_uses(&ebbs, &mut renamed);
 
         for renamed in renamed.as_slice() {
             debug!(
@@ -228,6 +313,7 @@ impl<'a> Context<'a> {
             );
         }
 
+        self.compute_bbgraph(&ebbs);
         let df = self.compute_dominance_frontiers();
 
         debug!("Dominance frontiers {:?}", df);
@@ -294,37 +380,35 @@ impl<'a> Context<'a> {
     fn find_redefinition(&mut self, use_inst: Inst, name: Value, new_names: &Vec<Value>, idf: &IDF)
                          -> (Option<Value>, Option<(Value, Vec<Inst>)>) {
         let layout = &self.cur.func.layout;
-        let dfg = &mut self.cur.func.dfg;
+        let dfg = &self.cur.func.dfg;
 
         let use_pp = ExpandedProgramPoint::from(use_inst);
-        let use_ebb = layout.inst_ebb(use_inst).unwrap();
 
-        // EBB NOT OK HERE
-        let mut target_ebb = layout.inst_ebb(use_inst).expect("not in layout");
+        let use_bb = self.inst_bb(use_inst);
+        let mut target_bb = use_bb;
         let mut found = None;
         let mut phi_info = None;
 
         'find_closest_defn:
         loop {
-            // Search target_ebb for the closest preceding definition (if target_ebb == use_ebb), or
+            // Search target_ebb for the closest preceding definition (if target_bb == use_bb), or
             // the last definition (otherwise).
 
-            let mut max_defn_pp = ExpandedProgramPoint::from(target_ebb);
+            let mut max_defn_pp = ExpandedProgramPoint::from(target_bb);
             for new_defn in new_names.into_iter() {
-                let (defn_ebb, defn_pp) = match dfg.value_def(*new_defn) {
+                let (defn_bb, defn_pp) = match dfg.value_def(*new_defn) {
                     ValueDef::Result(defn_inst, _) =>
-                        (layout.inst_ebb(defn_inst).unwrap(),
+                        (self.inst_bb(defn_inst),
                          ExpandedProgramPoint::from(defn_inst)),
                     ValueDef::Param(defn_ebb, _) =>
-                        (defn_ebb, ExpandedProgramPoint::from(defn_ebb))
+                        (self.ebb_bb(defn_ebb), ExpandedProgramPoint::from(defn_ebb))
                 };
 
-                if defn_ebb != target_ebb {
+                if defn_bb != target_bb {
                     continue;
                 }
 
-                // EBB NOT OK HERE
-                if target_ebb != use_ebb || layout.cmp(defn_pp, use_pp) == Ordering::Less {
+                if target_bb != use_bb || layout.cmp(defn_pp, use_pp) == Ordering::Less {
                     if found.is_none() || layout.cmp(max_defn_pp, defn_pp) == Ordering::Less {
                         found = Some(*new_defn);
                         max_defn_pp = defn_pp;
@@ -338,29 +422,28 @@ impl<'a> Context<'a> {
                 break 'find_closest_defn;
             }
 
-            // The target_ebb had no definition.  If there's a dominator, then either target_ebb is
-            // in the IDF of `name` and we must insert a phi (and use this phi as our result), or we
-            // walk up to target_ebb's immediate dominator and search there.
+            // The target_bb had no definition.  If there's a dominator, then either target_bb is in
+            // the IDF of `name` and we must insert a phi (and use this phi as our result), or we
+            // walk up to target_bb's immediate dominator and search there.
 
-            // EBB NOT OK HERE
-
-            match self.domtree.idom(target_ebb) {
+            match self.bb_idom(target_bb) {
                 None => {
                     break 'find_closest_defn;
                 }
                 Some(idom) => {
-                    if idf.contains_key(target_ebb) {
-                        let phi_name = dfg.append_ebb_param(target_ebb, dfg.value_type(name));
+                    if idf.contains_key(target_bb) {
+                        let target_ebb = self.bb_ebb(target_bb);
+                        let phi_name = self.cur.func.dfg.append_ebb_param(target_ebb, dfg.value_type(name));
                         let mut new_uses = vec![];
                         for BasicBlock { inst, .. } in self.cfg.pred_iter(target_ebb) {
-                            dfg.append_inst_arg(inst, name);
+                            self.cur.func.dfg.append_inst_arg(inst, name);
                             new_uses.push(inst);
                         }
                         found = Some(phi_name);
                         phi_info = Some((phi_name, new_uses));
                         break 'find_closest_defn;
                     } else {
-                        target_ebb = layout.inst_ebb(idom).expect("idom not in layout");
+                        target_bb = idom;
                     }
                 }
             }
@@ -372,80 +455,26 @@ impl<'a> Context<'a> {
     // Compute the Dominance Frontier for all nodes.  Taken from:
     //
     //   Keith D. Cooper and Linda Torczon, Engineering a Compiler, 1st Ed, sect 9.3.2.
-    //
-    // FIXME: This may not be correct for EBBs with side exits?
-
-    /*
-
-Here ebb2 is the join point.  Its idom is ebb0.  It has 2 predecessors, ebb3 and ebb5.  But only the
-first part of ebb0 is the idom of ebb2, the second part of ebb0 is not.  This is a bit of a mess.
-
-The value returned from the idom() function actually encodes this by representing the idom as
-the control flow instruction, that is, the idom of ebb2 is the brz.  Then we make a mistake by
-mapping that instruction to its ebb.
-
-In the case of the definition search, there may be a risk that we find a definition that is past the
-CFI that terminates the BB.  So that has to be fixed too.
-
-But for the DF computation, we can't use EBBs like we do - it's just wrong.  We need to use BBs somehow.
-
-A BB is thus a linear range of instructions within an ebb, but if the ebb can have multiple side
-exits there can be more than two BBs.  It's uncertain what the idom computation does about that; we
-need to investigate.  It should return the preceding range in the same ebb.
-
-                                ebb0(v0: i32, v1: i64):
-                                    v10 -> v0
-@0044 [RexOp1tjccb#74]              brz v0, ebb4
-@0048 [Op1call_id#e8]               v12 = call fn0(v1)
-@0048 [null#00]                     v5 = ireduce.i32 v12
-@004c [RexOp1rr#01]                 v6 = iadd v5, v0
-@004d [Op1jmpb#eb]                  jump ebb3(v6)
-
-                                ebb3(v4: i32):
-@004e [Op1jmpb#eb]                  jump ebb2(v4)
-
-                                ebb4:
-@0055 [RexOp1r_ib#83]               v9 = iadd_imm.i32 v0, 1
-@0056 [Op1jmpb#eb]                  jump ebb5(v9)
-
-                                ebb5(v7: i32):
-@0057 [Op1jmpb#eb]                  jump ebb2(v7)
-
-                                ebb2(v3: i32):
-@005a [RexOp1rr#01]                 v11 = iadd v3, v0
-@005b [Op1jmpb#eb]                  jump ebb1(v11)
-
-                                ebb1(v2: i32):
-@005b [RexOp1umr#89]                v13 = uextend.i64 v2
-@005b [-]                           fallthrough_return v13
-
-     */
     
-    //But the tail only has one predecessor.
-    //
-    // FIXME: does this affect the idom walk when we look for a definition too?
-
     fn compute_dominance_frontiers(&self) -> AllDF {
         let mut df = AllDF::new();
 
-        // EBB NOT OK HERE
-
-        for n in self.cur.func.layout.ebbs() {
-            // Ugly hack, we just want the number of predecessors first, and then we can iterate
-            // peacefully over the list.  And the pred_iter wraps the ebb in a BasicBlock and here
-            // we just strip it again; There Must Be A Better Way.
-            let preds: Vec<Ebb> = self.cfg.pred_iter(n).map(|bb| bb.ebb).collect();
-            if preds.len() >= 2 {
-                let idom_n = self.cur.func.layout.inst_ebb(self.domtree.idom(n).unwrap()).unwrap();
-                for p in preds {
-                    let mut runner = p;
-                    while runner != idom_n {
-                        df[runner].insert(n);
-                        runner = self.cur.func.layout.inst_ebb(self.domtree.idom(runner).unwrap()).unwrap();
+        for bbs in self.bbgraph.info.values() {
+            for n in bbs {
+                // Only the first bb in a block can have this be true...
+                if self.num_preds(*n) >= 2 {
+                    let idom_n = self.bb_idom(*n).unwrap();
+                    for p in self.bb_preds(*n) {
+                        let mut runner = p;
+                        while runner != idom_n {
+                            df[runner].insert(*n);
+                            runner = self.bb_idom(runner).unwrap();
+                        }
                     }
                 }
             }
         }
+
         df
     }
 
@@ -458,18 +487,16 @@ need to investigate.  It should return the preceding range in the same ebb.
 
     fn compute_idf(&mut self, df: &AllDF, name: Value, new_names: &Vec<Value>) -> IDF {
         let mut worklist = vec![];
-        let mut in_worklist = SparseEbbSet::new();
-
-        // EBB NOT OK HERE
+        let mut in_worklist = SparseBBSet::new();
 
         {
-            let start = self.defining_ebb(name);
+            let start = self.defining_bb(name);
             worklist.push(start);
             in_worklist.insert(start);
         }
         for n in new_names {
             debug!("  New name {}", *n);
-            let block = self.defining_ebb(*n);
+            let block = self.defining_bb(*n);
             if !in_worklist.contains_key(block) {
                 worklist.push(block);
                 in_worklist.insert(block);
@@ -494,15 +521,88 @@ need to investigate.  It should return the preceding range in the same ebb.
         idf
     }
 
-    // EBB NOT OK HERE
+    // Basic blocks.
 
-    fn defining_ebb(&self, defn:Value) -> Ebb {
+    fn defining_bb(&self, defn: Value) -> BB {
         match self.cur.func.dfg.value_def(defn) {
-            ValueDef::Param(defn_ebb, _) => defn_ebb,
-            ValueDef::Result(defn_inst, _) => self.cur.func.layout.inst_ebb(defn_inst).unwrap()
+            ValueDef::Param(defn_ebb, _) => self.ebb_bb(defn_ebb),
+            ValueDef::Result(defn_inst, _) => self.inst_bb(defn_inst)
         }
     }
 
+    // This num_preds / bb_preds thing isn't useful.  Really we just want
+    // to iterate over preds if there are at least two, which means, if
+    // we're at the beginning AND there are multiple predecessors.  So we
+    // should simplify.
+
+    fn num_preds(&self, bb: BB) -> u32 {
+        let ebb = self.bb_ebb(bb);
+        if self.bbgraph.info.get(ebb)[0] != bb {
+            1
+        } else {
+            // ebb->num predecessors
+            unimplemented!()
+        }
+    }
+
+    fn bb_preds(&self, bb: BB) -> Vec<BB> { // Very Bad API
+        // if not last then just the previous one
+        // otherwise inst->ebb and ebb->predecessors
+        unimplemented!();
+    }
+
+    /// The idom of the bb, itself a bb, or None if there is no idom.
+    fn bb_idom(&self, bb: BB) -> Option<BB> {
+        let (_, pos) = self.inst_bb_and_pos(self, bb);
+        if pos == 0 {
+            self.domtree.idom(ebb)
+        } else {
+            self.bbgraph.info.get(self.bb_ebb(bb))[pos-1];
+        }
+    }
+    
+    /// First BB in the Ebb
+    fn ebb_bb(&self, ebb: Ebb) -> BB {
+        self.bbgraph.info.get(ebb)[0]
+    }
+
+    /// The Ebb containing the BB
+    fn bb_ebb(&self, bb: BB) -> Ebb {
+        self.cur.func.layout.inst_ebb(bb).unwrap()
+    }
+
+    fn inst_bb(&self, inst: Inst) -> BB {
+        let (bb, _) = self.inst_bb_and_pos(inst);
+        bb
+    }
+
+    fn inst_bb_and_pos(&self, inst: Inst) -> (BB, usize) {
+        let info = self.bbgraph.info.get(self.be_ebb(inst));
+        let inst_pp = ExpandedProgramPoint::from(inst);
+        for i in 0..info.len() {
+            let bb = info[i];
+            let bb_pp = ExpandedProgramPoint::from(bb);
+            // Remember, bb_pp is at the end of the BB.
+            if self.cur.func.layout.cmp(inst_pp, bb_pp) != Ordering::Greater { 
+                return (bb, i);
+            }
+        }
+        panic!("Should not happen");
+    }
+
+    fn compute_bbgraph(&mut self, ebbs: &Vec<Ebb>) {
+        for ebb in ebbs {
+            let mut bbs = vec![];
+            self.cur.goto_top(*ebb);
+            while let Some(inst) = self.cur.next_inst() {
+                match self.cur.func.dfg.analyze_branch(inst) {
+                    BranchInfo::NotABranch => {}
+                    _ => { bbs.push(inst); }
+                }
+            }
+            self.bbgraph.info[*ebb] = bbs;
+        }
+    }
 
     // Insert copy-to-temp before a call and copy-from-temp after a call, and retain information
     // about the values that were copied and the names created after the call in `renamed`.
@@ -568,6 +668,7 @@ need to investigate.  It should return the preceding range in the same ebb.
 
         let call_sig = self.cur.func.dfg.call_signature(inst);
         if call_sig.is_some() {
+
             // Create temps before the instruction
             let mut temps = vec![];
             for lv in throughs {
@@ -576,8 +677,10 @@ need to investigate.  It should return the preceding range in the same ebb.
                     temps.push(temp);
                 }
             }
+
             // Move to next instruction so that we can insert copies after the call
             self.cur.next_inst();
+
             // Create copies of the temps after the instruction
             let mut i = 0;
             for lv in throughs {
@@ -589,7 +692,7 @@ need to investigate.  It should return the preceding range in the same ebb.
                     if let Some(r) = renamed.get_mut(lv.value) {
                         r.new_names.push(copy);
                     } else {
-                        let mut r = SplitValue::new(lv.value);
+                        let mut r = RenamedValue::new(lv.value);
                         r.new_names.push(copy);
                         renamed.insert(r);
                     }
@@ -603,15 +706,16 @@ need to investigate.  It should return the preceding range in the same ebb.
     // Collect use information for all variables in `renamed`.  This will include newly inserted
     // copies.
 
-    fn collect_uses(&mut self, renamed: &mut Renamed) {
-        for ebb in self.cur.func.layout.ebbs().collect::<Vec<Ebb>>() {
-            self.ebb_collect_uses(ebb, renamed);
+    fn collect_uses(&mut self, ebbs: &Vec<Ebb>, renamed: &mut Renamed) {
+        for ebb in ebbs {
+            self.ebb_collect_uses(*ebb, renamed);
         }
     }
 
     fn ebb_collect_uses(&mut self, ebb: Ebb, renamed: &mut Renamed) {
         self.cur.goto_top(ebb);
         while let Some(inst) = self.cur.next_inst() {
+
             // Now inspect all the uses and if one is a Value defined in renamed, record this
             // instruction with that info.
             //
@@ -620,6 +724,7 @@ need to investigate.  It should return the preceding range in the same ebb.
             // instruction with the use several times but each time we'll replace one use with the
             // new one.  On the other hand, that means multiple searches up the tree.  On the third
             // hand, how often is this an issue?
+
             for arg in self.cur.func.dfg.inst_args(inst) {
                 if let Some(info) = renamed.get_mut(*arg) {
                     info.uses.push(inst);
