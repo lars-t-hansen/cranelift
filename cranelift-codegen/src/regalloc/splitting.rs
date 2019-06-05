@@ -50,52 +50,10 @@
 //
 //   S. Hack: Register Allocation for Programs in SSA Form, PhD Dissertation, University of
 //   Karlsruhe, 2006.
-
-/*  FIXME: Note this
-
-Here ebb2 is the join point.  Its idom is ebb0.  It has 2 predecessors, ebb3 and ebb5.  But only the
-first part of ebb0 is the idom of ebb2, the second part of ebb0 is not.  This is a bit of a mess.
-
-The value returned from the idom() function actually encodes this by representing the idom as
-the control flow instruction, that is, the idom of ebb2 is the brz.  Then we make a mistake by
-mapping that instruction to its ebb.
-
-In the case of the definition search, there may be a risk that we find a definition that is past the
-CFI that terminates the BB.  So that has to be fixed too.
-
-But for the DF computation, we can't use EBBs like we do - it's just wrong.  We need to use BBs somehow.
-
-A BB is thus a linear range of instructions within an ebb, but if the ebb can have multiple side
-exits there can be more than two BBs.  It's uncertain what the idom computation does about that; we
-need to investigate.  It should return the preceding range in the same ebb.
-
-                                ebb0(v0: i32, v1: i64):
-                                    v10 -> v0
-@0044 [RexOp1tjccb#74]              brz v0, ebb4
-@0048 [Op1call_id#e8]               v12 = call fn0(v1)
-@0048 [null#00]                     v5 = ireduce.i32 v12
-@004c [RexOp1rr#01]                 v6 = iadd v5, v0
-@004d [Op1jmpb#eb]                  jump ebb3(v6)
-
-                                ebb3(v4: i32):
-@004e [Op1jmpb#eb]                  jump ebb2(v4)
-
-                                ebb4:
-@0055 [RexOp1r_ib#83]               v9 = iadd_imm.i32 v0, 1
-@0056 [Op1jmpb#eb]                  jump ebb5(v9)
-
-                                ebb5(v7: i32):
-@0057 [Op1jmpb#eb]                  jump ebb2(v7)
-
-                                ebb2(v3: i32):
-@005a [RexOp1rr#01]                 v11 = iadd v3, v0
-@005b [Op1jmpb#eb]                  jump ebb1(v11)
-
-                                ebb1(v2: i32):
-@005b [RexOp1umr#89]                v13 = uextend.i64 v2
-@005b [-]                           fallthrough_return v13
-
-     */
+//
+// One wrinkle is that many algorithms for SSA munging are expressed in terms of basic blocks and
+// not extended basic blocks, and are incorrect if we ignore the distinction.  This is in particular
+// true of dominance frontiers.  Hence we have to translate from Ebbs to BBs in this module.
 
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
@@ -213,21 +171,22 @@ impl<'a> Iterator for SparseBBSetIterator<'a> {
     }
 }
 
-// A basic block (BB) is represented as the control transfer instruction within an Ebb that ends the
-// BB.  Given a BB we can map it to its containing Ebb using layout.inst_ebb(), and then we can find
-// the relative position of the BB within the Ebb by scanning the information associated with the
-// Ebb.
-//
-// At the non-first BB in an Ebb:
-// - its idom is the preceding BB in the Ebb
-// - its only predecessor is the preceding BB in the Ebb
-//
-// At the first BB in an Ebb:
-// - the domtree.idom() method is applied to the Ebb and yields the BB that is the idom
-// - the cfg.pred_iter() method is applied to the Ebb and yields the BBs that are the predecessors
-
+/// A basic block (BB) is represented as the control transfer instruction within an Ebb that ends
+/// the BB.  Given a BB we can map it to its containing Ebb using layout.inst_ebb(), and then we can
+/// find the relative position of the BB within the Ebb by scanning the information associated with
+/// the Ebb.
+///
+/// At the first BB in an Ebb:
+/// - the domtree.idom() method is applied to the Ebb and yields the BB that is the idom
+/// - the cfg.pred_iter() method is applied to the Ebb and yields the BBs that are the predecessors
+///
+/// At the non-first BB in an Ebb:
+/// - its idom is the preceding BB in the Ebb
+/// - its only predecessor is the preceding BB in the Ebb
 type BB = Inst;
 
+/// A basic block graph is represented as a map from Ebbs to a list of the BBs that are in the EBB,
+/// in order.
 struct BBGraph {
     info: SecondaryMap<Ebb, Vec<BB>>
 }
@@ -238,6 +197,7 @@ impl<'a> BBGraph {
             info: SecondaryMap::new()
         }
     }
+
 }
 
 type IDF = SparseBBSet;
@@ -314,7 +274,7 @@ impl<'a> Context<'a> {
         }
 
         self.compute_bbgraph(&ebbs);
-        let df = self.compute_dominance_frontiers();
+        let df = self.compute_dominance_frontiers(&ebbs);
 
         debug!("Dominance frontiers {:?}", df);
 
@@ -456,20 +416,24 @@ impl<'a> Context<'a> {
     //
     //   Keith D. Cooper and Linda Torczon, Engineering a Compiler, 1st Ed, sect 9.3.2.
     
-    fn compute_dominance_frontiers(&self) -> AllDF {
+    fn compute_dominance_frontiers(&self, ebbs:&Vec<Ebb>) -> AllDF {
         let mut df = AllDF::new();
 
-        for bbs in self.bbgraph.info.values() {
-            for n in bbs {
-                // Only the first bb in a block can have this be true...
-                if self.num_preds(*n) >= 2 {
-                    let idom_n = self.bb_idom(*n).unwrap();
-                    for p in self.bb_preds(*n) {
-                        let mut runner = p;
-                        while runner != idom_n {
-                            df[runner].insert(*n);
-                            runner = self.bb_idom(runner).unwrap();
-                        }
+        // The outer loop can iterate over ebbs because only ebbs can have more than one
+        // predecessor.
+        for ebb in ebbs {
+            // TODO: Ugly hack, we just want the number of predecessors first, and then we can
+            // iterate peacefully over the list.  And the pred_iter wraps the ebb in a BasicBlock
+            // and here we just strip it again; There Must Be A Better Way.
+            let preds: Vec<Ebb> = self.cfg.pred_iter(*ebb).map(|bb| bb.ebb).collect();
+            if preds.len() >= 2 {
+                let n = self.ebb_bb(*ebb);
+                let idom_n = self.bb_idom(n).unwrap();
+                for p in preds {
+                    let mut runner = self.ebb_bb(p);
+                    while runner != idom_n {
+                        df[runner].insert(n);
+                        runner = self.bb_idom(runner).unwrap();
                     }
                 }
             }
@@ -530,40 +494,19 @@ impl<'a> Context<'a> {
         }
     }
 
-    // This num_preds / bb_preds thing isn't useful.  Really we just want
-    // to iterate over preds if there are at least two, which means, if
-    // we're at the beginning AND there are multiple predecessors.  So we
-    // should simplify.
-
-    fn num_preds(&self, bb: BB) -> u32 {
-        let ebb = self.bb_ebb(bb);
-        if self.bbgraph.info.get(ebb)[0] != bb {
-            1
-        } else {
-            // ebb->num predecessors
-            unimplemented!()
-        }
-    }
-
-    fn bb_preds(&self, bb: BB) -> Vec<BB> { // Very Bad API
-        // if not last then just the previous one
-        // otherwise inst->ebb and ebb->predecessors
-        unimplemented!();
-    }
-
     /// The idom of the bb, itself a bb, or None if there is no idom.
     fn bb_idom(&self, bb: BB) -> Option<BB> {
-        let (_, pos) = self.inst_bb_and_pos(self, bb);
+        let (ebb, _, pos) = self.inst_info(bb);
         if pos == 0 {
             self.domtree.idom(ebb)
         } else {
-            self.bbgraph.info.get(self.bb_ebb(bb))[pos-1];
+            Some(self.bbgraph.info.get(ebb).unwrap()[pos-1])
         }
     }
     
     /// First BB in the Ebb
     fn ebb_bb(&self, ebb: Ebb) -> BB {
-        self.bbgraph.info.get(ebb)[0]
+        self.bbgraph.info.get(ebb).unwrap()[0]
     }
 
     /// The Ebb containing the BB
@@ -572,19 +515,20 @@ impl<'a> Context<'a> {
     }
 
     fn inst_bb(&self, inst: Inst) -> BB {
-        let (bb, _) = self.inst_bb_and_pos(inst);
+        let (_, bb, _) = self.inst_info(inst);
         bb
     }
 
-    fn inst_bb_and_pos(&self, inst: Inst) -> (BB, usize) {
-        let info = self.bbgraph.info.get(self.be_ebb(inst));
+    fn inst_info(&self, inst: Inst) -> (Ebb, BB, usize) {
+        let ebb = self.bb_ebb(inst);
+        let info = self.bbgraph.info.get(ebb).unwrap();
         let inst_pp = ExpandedProgramPoint::from(inst);
         for i in 0..info.len() {
             let bb = info[i];
             let bb_pp = ExpandedProgramPoint::from(bb);
             // Remember, bb_pp is at the end of the BB.
             if self.cur.func.layout.cmp(inst_pp, bb_pp) != Ordering::Greater { 
-                return (bb, i);
+                return (ebb, bb, i);
             }
         }
         panic!("Should not happen");
