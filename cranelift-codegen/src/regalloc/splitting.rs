@@ -187,6 +187,7 @@ type BB = Inst;
 
 /// A basic block graph is represented as a map from Ebbs to a list of the BBs that are in the EBB,
 /// in order.
+#[derive(Debug)]
 struct BBGraph {
     info: SecondaryMap<Ebb, Vec<BB>>
 }
@@ -266,9 +267,11 @@ impl<'a> Context<'a> {
         self.insert_temps(&mut renamed);
         self.collect_uses(&ebbs, &mut renamed);
 
+        debug!("After inserting temps:\n{}", self.cur.func.display(self.cur.isa));
+
         for renamed in renamed.as_slice() {
             debug!(
-                "Renamed {} -> {:?}, {:?}",
+                "Renamed\n   {} -> {:?}, {:?}",
                 renamed.value, renamed.new_names, renamed.uses
             );
         }
@@ -276,6 +279,16 @@ impl<'a> Context<'a> {
         self.compute_bbgraph(&ebbs);
         let df = self.compute_dominance_frontiers(&ebbs);
 
+        // We should print the ebb graph with info about bbs and dfs together
+        //
+        // ebb0
+        //   inst df
+        //   ...
+        //
+        // where for each bb there is the instruction that terminates it and its dominance frontier
+        // if not empty and only print df if it is not empty.
+
+        debug!("Basic blocks:\n", self.bbgraph);
         debug!("Dominance frontiers {:?}", df);
 
         self.rename_uses(df, renamed);
@@ -412,36 +425,6 @@ impl<'a> Context<'a> {
         (found, phi_info)
     }
 
-    // Compute the Dominance Frontier for all nodes.  Taken from:
-    //
-    //   Keith D. Cooper and Linda Torczon, Engineering a Compiler, 1st Ed, sect 9.3.2.
-    
-    fn compute_dominance_frontiers(&self, ebbs:&Vec<Ebb>) -> AllDF {
-        let mut df = AllDF::new();
-
-        // The outer loop can iterate over ebbs because only ebbs can have more than one
-        // predecessor.
-        for ebb in ebbs {
-            // TODO: Ugly hack, we just want the number of predecessors first, and then we can
-            // iterate peacefully over the list.  And the pred_iter wraps the ebb in a BasicBlock
-            // and here we just strip it again; There Must Be A Better Way.
-            let preds: Vec<Ebb> = self.cfg.pred_iter(*ebb).map(|bb| bb.ebb).collect();
-            if preds.len() >= 2 {
-                let n = self.ebb_bb(*ebb);
-                let idom_n = self.bb_idom(n).unwrap();
-                for p in preds {
-                    let mut runner = self.ebb_bb(p);
-                    while runner != idom_n {
-                        df[runner].insert(n);
-                        runner = self.bb_idom(runner).unwrap();
-                    }
-                }
-            }
-        }
-
-        df
-    }
-
     // Compute the Iterated Dominance Frontier for the nodes containing the definitions of the name
     // in question.  This is a straightforward worklist algorithm, the central fact is that DF(S)
     // for a set S of nodes is the union of DF(x) across x in S.  See:
@@ -485,12 +468,62 @@ impl<'a> Context<'a> {
         idf
     }
 
-    // Basic blocks.
-
     fn defining_bb(&self, defn: Value) -> BB {
         match self.cur.func.dfg.value_def(defn) {
             ValueDef::Param(defn_ebb, _) => self.ebb_bb(defn_ebb),
             ValueDef::Result(defn_inst, _) => self.inst_bb(defn_inst)
+        }
+    }
+
+    // Compute the Dominance Frontier for all BB nodes.  Taken from:
+    //
+    //   Keith D. Cooper and Linda Torczon, Engineering a Compiler, 1st Ed, sect 9.3.2.
+
+    fn compute_dominance_frontiers(&self, ebbs:&Vec<Ebb>) -> AllDF {
+        let mut df = AllDF::new();
+
+        // The outer loop can iterate over ebbs because only ebbs can have more than one
+        // predecessor.
+        for ebb in ebbs {
+            // TODO: Ugly hack, we just want the number of predecessors first, and then we can
+            // iterate peacefully over the list.  And the pred_iter wraps the ebb in a BasicBlock
+            // and here we just strip it again; There Must Be A Better Way.
+            let preds: Vec<Ebb> = self.cfg.pred_iter(*ebb).map(|bb| bb.ebb).collect();
+            if preds.len() >= 2 {
+                let n = self.ebb_bb(*ebb);
+                let idom_n = self.bb_idom(n).unwrap();
+                for p in preds {
+                    let mut runner = self.ebb_bb(p);
+                    while runner != idom_n {
+                        df[runner].insert(n);
+                        runner = self.bb_idom(runner).unwrap();
+                    }
+                }
+            }
+        }
+
+        df
+    }
+
+    // Basic blocks.
+
+    /// Compute and record the lists of BBs in the Ebbs.
+    fn compute_bbgraph(&mut self, ebbs: &Vec<Ebb>) {
+        for ebb in ebbs {
+            let mut bbs = vec![];
+            self.cur.goto_top(*ebb);
+            let mut got_last = false;
+            while let Some(inst) = self.cur.next_inst() {
+                got_last = false;
+                let op = self.cur.func.dfg[inst].opcode();
+                if op.is_branch() || op.is_return() {
+                    bbs.push(inst);
+                    got_last = true;
+                }
+            }
+            debug_assert!(got_last);
+            debug_assert!(bbs.len() > 0);
+            self.bbgraph.info[*ebb] = bbs;
         }
     }
 
@@ -504,16 +537,17 @@ impl<'a> Context<'a> {
         }
     }
     
-    /// First BB in the Ebb
+    /// First BB in the Ebb.
     fn ebb_bb(&self, ebb: Ebb) -> BB {
         self.bbgraph.info.get(ebb).unwrap()[0]
     }
 
-    /// The Ebb containing the BB
+    /// The Ebb containing the BB.
     fn bb_ebb(&self, bb: BB) -> Ebb {
         self.cur.func.layout.inst_ebb(bb).unwrap()
     }
 
+    /// The BB containing the instruction.
     fn inst_bb(&self, inst: Inst) -> BB {
         let (_, bb, _) = self.inst_info(inst);
         bb
@@ -532,20 +566,6 @@ impl<'a> Context<'a> {
             }
         }
         panic!("Should not happen");
-    }
-
-    fn compute_bbgraph(&mut self, ebbs: &Vec<Ebb>) {
-        for ebb in ebbs {
-            let mut bbs = vec![];
-            self.cur.goto_top(*ebb);
-            while let Some(inst) = self.cur.next_inst() {
-                match self.cur.func.dfg.analyze_branch(inst) {
-                    BranchInfo::NotABranch => {}
-                    _ => { bbs.push(inst); }
-                }
-            }
-            self.bbgraph.info[*ebb] = bbs;
-        }
     }
 
     // Insert copy-to-temp before a call and copy-from-temp after a call, and retain information
