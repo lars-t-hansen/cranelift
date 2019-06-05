@@ -178,6 +178,7 @@ impl<'a> Iterator for SparseEbbSetIterator<'a> {
 }
 
 type IDF = SparseEbbSet;
+type AllDF = SecondaryMap<Ebb, SparseEbbSet>;
 
 impl Splitting {
     /// Create a new splitting data structure.
@@ -216,6 +217,7 @@ impl Splitting {
 impl<'a> Context<'a> {
     fn run(&mut self) {
         let mut renamed = Renamed::new();
+
         self.insert_temps(&mut renamed);
         self.collect_uses(&mut renamed);
 
@@ -226,14 +228,14 @@ impl<'a> Context<'a> {
             );
         }
 
-        let df = self.compute_df();
+        let df = self.compute_dominance_frontiers();
 
         debug!("Dominance frontiers {:?}", df);
 
-        self.rename_uses(&df, &mut renamed);
+        self.rename_uses(df, renamed);
     }
 
-    fn rename_uses(&mut self, df: &SecondaryMap<Ebb, SparseEbbSet>, renamed: &mut Renamed) {
+    fn rename_uses(&mut self, df: AllDF, mut renamed: Renamed) {
         // TODO: This feels deeply wrong
         let mut keys = vec![];
         for renamed in renamed.into_iter() {
@@ -244,7 +246,7 @@ impl<'a> Context<'a> {
         for key in keys {
             let r = renamed.get_mut(key).unwrap();
             debug!("Renaming {}", r.value);
-            let idf = self.compute_idf(df, r.value, &r.new_names);
+            let idf = self.compute_idf(&df, r.value, &r.new_names);
             debug!("  IDF {:?}", idf);
             let mut worklist = r.uses.clone(); // Really we should be able to just own this...
             let mut i = 0;
@@ -297,6 +299,7 @@ impl<'a> Context<'a> {
         let use_pp = ExpandedProgramPoint::from(use_inst);
         let use_ebb = layout.inst_ebb(use_inst).unwrap();
 
+        // EBB NOT OK HERE
         let mut target_ebb = layout.inst_ebb(use_inst).expect("not in layout");
         let mut found = None;
         let mut phi_info = None;
@@ -320,6 +323,7 @@ impl<'a> Context<'a> {
                     continue;
                 }
 
+                // EBB NOT OK HERE
                 if target_ebb != use_ebb || layout.cmp(defn_pp, use_pp) == Ordering::Less {
                     if found.is_none() || layout.cmp(max_defn_pp, defn_pp) == Ordering::Less {
                         found = Some(*new_defn);
@@ -337,6 +341,8 @@ impl<'a> Context<'a> {
             // The target_ebb had no definition.  If there's a dominator, then either target_ebb is
             // in the IDF of `name` and we must insert a phi (and use this phi as our result), or we
             // walk up to target_ebb's immediate dominator and search there.
+
+            // EBB NOT OK HERE
 
             match self.domtree.idom(target_ebb) {
                 None => {
@@ -419,8 +425,8 @@ need to investigate.  It should return the preceding range in the same ebb.
     //
     // FIXME: does this affect the idom walk when we look for a definition too?
 
-    fn compute_df(&self) -> SecondaryMap<Ebb, SparseEbbSet> {
-        let mut df = SecondaryMap::<Ebb, SparseEbbSet>::new();
+    fn compute_dominance_frontiers(&self) -> AllDF {
+        let mut df = AllDF::new();
 
         // EBB NOT OK HERE
 
@@ -450,7 +456,7 @@ need to investigate.  It should return the preceding range in the same ebb.
     //   Ron Cytron, Jeanne Ferrante, Barry K Rosen and Mark N Wegman, Efficiently Computing Static
     //   Single Assignment Form and the Control Dependence Graph, ACM TOPLAS vol 13, no 4, Oct 1991.
 
-    fn compute_idf(&mut self, df:&SecondaryMap<Ebb, SparseEbbSet>, name: Value, new_names: &Vec<Value>) -> IDF {
+    fn compute_idf(&mut self, df: &AllDF, name: Value, new_names: &Vec<Value>) -> IDF {
         let mut worklist = vec![];
         let mut in_worklist = SparseEbbSet::new();
 
@@ -471,7 +477,7 @@ need to investigate.  It should return the preceding range in the same ebb.
         }
 
         debug!("  Worklist {:?}", worklist);
-        let mut idf = SparseEbbSet::new();
+        let mut idf = IDF::new();
         while let Some(block) = worklist.pop() {
             debug!("  Processing {}", block);
             for dblock in &df[block] {
@@ -502,10 +508,8 @@ need to investigate.  It should return the preceding range in the same ebb.
     // about the values that were copied and the names created after the call in `renamed`.
 
     fn insert_temps(&mut self, renamed: &mut Renamed) {
-        // EBB OK HERE
+        // Topo-ordered traversal because we track liveness precisely.
         let mut tracker = LiveValueTracker::new();
-
-        // Topo-ordered traversal is required because we track liveness precisely.
         self.topo.reset(self.cur.func.layout.ebbs());
         while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
             self.ebb_insert_temps(ebb, renamed, &mut tracker);
@@ -600,7 +604,6 @@ need to investigate.  It should return the preceding range in the same ebb.
     // copies.
 
     fn collect_uses(&mut self, renamed: &mut Renamed) {
-        // EBB OK HERE
         for ebb in self.cur.func.layout.ebbs().collect::<Vec<Ebb>>() {
             self.ebb_collect_uses(ebb, renamed);
         }
