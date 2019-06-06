@@ -61,7 +61,6 @@ use crate::entity::{SecondaryMap, SparseMap, SparseMapValue};
 use crate::flowgraph::{BasicBlock, ControlFlowGraph};
 use crate::ir::{Ebb, Function, Inst, InstBuilder, Value, ValueDef};
 use crate::ir::{ExpandedProgramPoint, ProgramOrder};
-use crate::ir::instructions::BranchInfo;
 use crate::isa::TargetIsa;
 use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::regalloc::liveness::Liveness;
@@ -299,32 +298,34 @@ impl<'a> Context<'a> {
     }
 
     fn rename_uses(&mut self, df: AllDF, mut renamed: Renamed) {
+
         // TODO: This feels deeply wrong
         let mut keys = vec![];
         for renamed in renamed.into_iter() {
             keys.push(renamed.value);
         }
 
+        // Whether a name is old or new doesn't matter, what matters is that we must be able to find
+        // its definition.
+        for key in &keys {
+            let r = renamed.get_mut(*key).unwrap();
+            r.new_names.push(r.value);
+        }
+
         // Correct the references to renamed variables and insert phis if necessary.
-        for key in keys {
-            let r = renamed.get_mut(key).unwrap();
-            debug_assert!(key == r.value);
+        for key in &keys {
+            let r = renamed.get_mut(*key).unwrap();
             debug!("Renaming for {}", r.value);
-            let idf = self.compute_idf(&df, r.value, &r.new_names);
+            let idf = self.compute_idf(&df, &r.new_names);
             debug!("  IDF {:?}", idf);
             let mut worklist = r.uses.clone(); // Really we should be able to just own this...
             let mut i = 0;
             while i < worklist.len() {
                 let use_inst = worklist[i];
-                debug!("  Processing {:?}", use_inst);
                 i += 1;
+                debug!("  Processing {:?}", use_inst);
                 let (found, inserted) =
                     self.find_redefinition(use_inst, r.value, &r.new_names, &idf);
-                if found.is_some() {
-                    debug!("Did find a new definition");
-                } else {
-                    debug!("Did not find a new definition");
-                }
                 if let Some(new_defn) = found {
                     // Found a new definition, rename the first use in use_inst with a reference to
                     // this definition.
@@ -335,8 +336,11 @@ impl<'a> Context<'a> {
                     for arg in self.cur.func.dfg.inst_args_mut(use_inst) {
                         if *arg == r.value {
                             *arg = new_defn;
+                            break;
                         }
                     }
+                } else {
+                    debug!("No replacement");
                 }
                 if let Some((phi_name, mut new_uses)) = inserted {
                     r.new_names.push(phi_name);
@@ -346,26 +350,23 @@ impl<'a> Context<'a> {
         }
     }
 
-    // Search for a redefinition in each ebb up the dominator tree from the use.  We may reach the
-    // top without finding anything.
+    // Search for a definition in each ebb up the dominator tree from the use.  We may find the
+    // original definition.
     //
-    // Oh, that's a problem for loops containing phis with definitions I think...
-    //
-    // If the target ebb has a redefinition, then pick the latest such definition in the block,
-    // except that if the target ebb is the ebb with the use then pick the latest definition that
-    // precedes the use.
+    // If the target ebb has a definition, then pick the latest such definition in the block, except
+    // that if the target ebb is the ebb with the use then pick the latest definition that precedes
+    // the use.
     //
     // If the target ebb is in the iterated dominance frontier for the original name and does not
-    // otherwise have a redefinition, then we insert a phi in the target ebb to act as a
-    // redefinition, and we return the name defined by the phi.  Inserting a phi also adds uses of
-    // the original name to all predecessor blocks, so they become new uses.
+    // otherwise have a definition, then we insert a phi in the target ebb to act as a redefinition,
+    // and we return the name defined by the phi.  Inserting a phi also adds uses of the original
+    // name to all predecessor blocks, so they become new uses.
     //
-    // Thus we return a triple: the redefinition we've chosen; optionally a new
-    // definition; and optionally new uses for the original name in predecessor blocks.
+    // Thus we return a triple: the redefinition we've chosen; optionally a new definition; and
+    // optionally new uses for the original name in predecessor blocks.
 
-    fn find_redefinition(&mut self, use_inst: Inst, name: Value, new_names: &Vec<Value>, idf: &IDF)
+    fn find_redefinition(&mut self, use_inst: Inst, name: Value, defns: &Vec<Value>, idf: &IDF)
                          -> (Option<Value>, Option<(Value, Vec<Inst>)>) {
-        let layout = &self.cur.func.layout;
         let dfg = &self.cur.func.dfg;
 
         let use_pp = ExpandedProgramPoint::from(use_inst);
@@ -374,111 +375,98 @@ impl<'a> Context<'a> {
         let mut target_bb = use_bb;
 
         loop {
-            // Search target_ebb for the closest preceding definition (if target_bb == use_bb), or
-            // the last definition (otherwise).
+            // If we find an existing definition for one of the defns in target_bb we're done,
+            // returning the best such definition.
 
             debug!("target_bb = {}, use_bb = {}", target_bb, use_bb);
-
-            let mut found = None;
-            let mut max_defn_pp = ExpandedProgramPoint::from(self.inst_bb(target_bb));
-
-            // Bad hack
-            let mut new_names = new_names.clone();
-            new_names.push(name);
-
-            for new_defn in &new_names {
-                debug!("Target name = {}", *new_defn);
-                let (defn_bb, defn_pp) = match dfg.value_def(*new_defn) {
-                    ValueDef::Result(defn_inst, _) => {
-                        debug!("Defn found as result in {} in {}", defn_inst, self.inst_bb(defn_inst));
-                        (self.inst_bb(defn_inst),
-                         ExpandedProgramPoint::from(defn_inst))
-                    }
-                    ValueDef::Param(defn_ebb, _) => {
-                        debug!("Defn found as parameter in {} in {}", defn_ebb, self.ebb_bb(defn_ebb));
-                        (self.ebb_bb(defn_ebb), ExpandedProgramPoint::from(defn_ebb))
-                    }
-                };
-
-                if defn_bb != target_bb {
-                    debug!("Looping because no bb match, defn_bb = {}, target_bb = {}", defn_bb, target_bb);
-                    continue;
-                }
-
-                if target_bb != use_bb || layout.cmp(defn_pp, use_pp) == Ordering::Less {
-                    debug!("Got past first test, found = {:?}", found);
-                    if found.is_none() || layout.cmp(defn_pp, max_defn_pp) != Ordering::Greater {
-                        debug!("Updating because better");
-                        found = Some(*new_defn);
-                        max_defn_pp = defn_pp;
-                    }
-                }
-            }
-
-            // If we found a definition we're done.
-
-            if found.is_some() {
-                return (found, None);
+            if let Some(found) =
+                self.find_defn_in_bb(defns, target_bb,
+                                     if use_bb == target_bb { Some(use_pp) } else { None }) {
+                return (Some(found), None);
             }
 
             // The target_bb had no definition.  If there's a dominator, then either target_bb is in
             // the IDF of `name` and we must insert a phi (and use this phi as our result), or we
             // walk up to target_bb's immediate dominator and search there.
 
-/*
-            if self.bb_isfirst(target_bb) {
+            if idf.contains_key(target_bb) {
                 let target_ebb = self.bb_ebb(target_bb);
-                debug!("  Local defs {:?}", self.cur.func.dfg.ebb_params(target_ebb));
-                for local_defn in self.cur.func.dfg.ebb_params(target_ebb) {
-                    if *local_defn == name {
-                        debug!("  Bailing out");
-                        return (None, None);
-                    }
+                let phi_name = self.cur.func.dfg.append_ebb_param(target_ebb, dfg.value_type(name));
+                debug!("  New phi name {} in {}", phi_name, target_ebb);
+                let mut new_uses = vec![];
+                for BasicBlock { inst, .. } in self.cfg.pred_iter(target_ebb) {
+                    self.cur.func.dfg.append_inst_arg(inst, name);
+                    new_uses.push(inst);
+                    debug!("  Name {} added to {:?} for phi name {}", name, inst, phi_name);
                 }
-            }
-             */
-            
-            match self.bb_idom(target_bb) {
-                None => {
-                    return (None, None);
-                }
-                Some(idom) => {
-                    if idf.contains_key(target_bb) {
-                        let target_ebb = self.bb_ebb(target_bb);
-                        let phi_name = self.cur.func.dfg.append_ebb_param(target_ebb, dfg.value_type(name));
-                        debug!("  New phi name {} in {}", phi_name, target_ebb);
-                        let mut new_uses = vec![];
-                        for BasicBlock { inst, .. } in self.cfg.pred_iter(target_ebb) {
-                            self.cur.func.dfg.append_inst_arg(inst, name);
-                            new_uses.push(inst);
-                            debug!("  Name {} added to {:?} for phi name {}", name, inst, phi_name);
-                        }
-                        return (Some(phi_name), Some((phi_name, new_uses)));
-                    }
 
-                    target_bb = idom;
-                }
+                // Probably we do not want this early return...  Hack's algorithm instead updates
+                // the set of defs, and uses recursion to deal with this phi as a new use.
+
+                return (Some(phi_name), Some((phi_name, new_uses)));
             }
+
+            target_bb = self.bb_idom(target_bb).unwrap();
         }
     }
 
-    // Compute the Iterated Dominance Frontier for the nodes containing the definitions of the name
-    // in question.  This is a straightforward worklist algorithm, the central fact is that DF(S)
-    // for a set S of nodes is the union of DF(x) across x in S.  See:
+    // Search target_ebb for the closest preceding definition (if target_bb == use_bb), or
+    // the last definition (otherwise).
+
+    fn find_defn_in_bb(&self, defns: &Vec<Value>, target_bb: BB, use_pp: Option<ExpandedProgramPoint>) -> Option<Value> {
+        let layout = &self.cur.func.layout;
+
+        let mut found = None;
+        let mut max_defn_pp = None;
+
+        for defn in defns {
+            if let Some(defn_pp) = self.find_one_defn_in_bb(*defn, target_bb) {
+                if !use_pp.is_some() || layout.cmp(defn_pp, use_pp.unwrap()) == Ordering::Less {
+                    if found.is_none() || layout.cmp(max_defn_pp.unwrap(), defn_pp) != Ordering::Greater {
+                        debug!("Updating because better");
+                        found = Some(*defn);
+                        max_defn_pp = Some(defn_pp);
+                    }
+                }
+            }
+        }
+
+        found
+    }
+        
+    fn find_one_defn_in_bb(&self, defn: Value, target_bb: BB) -> Option<ExpandedProgramPoint> {
+        let dfg = &self.cur.func.dfg;
+        debug!("Target name = {}", defn);
+        let (defn_bb, defn_pp) = match dfg.value_def(defn) {
+            ValueDef::Result(defn_inst, _) => {
+                debug!("Defn found as result in {} in {}", defn_inst, self.inst_bb(defn_inst));
+                (self.inst_bb(defn_inst),
+                 ExpandedProgramPoint::from(defn_inst))
+            }
+            ValueDef::Param(defn_ebb, _) => {
+                debug!("Defn found as parameter in {} in {}", defn_ebb, self.ebb_bb(defn_ebb));
+                (self.ebb_bb(defn_ebb), ExpandedProgramPoint::from(defn_ebb))
+            }
+        };
+        if defn_bb != target_bb {
+            None
+        } else {
+            Some(defn_pp)
+        }
+    }
+
+    // Compute the Iterated Dominance Frontier for the nodes containing the definitions of the
+    // defns.  This is a straightforward worklist algorithm, the central fact is that DF(S) for a
+    // set S of nodes is the union of DF(x) across x in S.  See:
     //
     //   Ron Cytron, Jeanne Ferrante, Barry K Rosen and Mark N Wegman, Efficiently Computing Static
     //   Single Assignment Form and the Control Dependence Graph, ACM TOPLAS vol 13, no 4, Oct 1991.
 
-    fn compute_idf(&mut self, df: &AllDF, name: Value, new_names: &Vec<Value>) -> IDF {
+    fn compute_idf(&mut self, df: &AllDF, defns: &Vec<Value>) -> IDF {
         let mut worklist = vec![];
         let mut in_worklist = SparseBBSet::new();
 
-        {
-            let start = self.defining_bb(name);
-            worklist.push(start);
-            in_worklist.insert(start);
-        }
-        for n in new_names {
+        for n in defns {
             let block = self.defining_bb(*n);
             if !in_worklist.contains_key(block) {
                 worklist.push(block);
@@ -565,18 +553,16 @@ impl<'a> Context<'a> {
     fn bb_idom(&self, bb: BB) -> Option<BB> {
         let (ebb, _, pos) = self.inst_info(bb);
         if pos == 0 {
-            let idom = self.domtree.idom(ebb);
-            debug!("bb = {}, idom = {:?}", bb, idom);
-            idom
+            self.domtree.idom(ebb)
         } else {
             Some(self.bbgraph.info.get(ebb).unwrap()[pos-1])
         }
     }
     
-    fn bb_isfirst(&self, bb: BB) -> bool {
-        let (_, _, pos) = self.inst_info(bb);
-        pos == 0
-    }
+    // fn bb_isfirst(&self, bb: BB) -> bool {
+    //     let (_, _, pos) = self.inst_info(bb);
+    //     pos == 0
+    // }
     
     /// First BB in the Ebb.
     fn ebb_bb(&self, ebb: Ebb) -> BB {
