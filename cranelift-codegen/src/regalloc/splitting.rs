@@ -522,17 +522,15 @@ impl<'a> Context<'a> {
         let mut df = AllDF::new();
 
         // The outer loop can iterate over ebbs because only ebbs can have more than one
-        // predecessor.
+        // predecessor.  But the predecessors are the BBs within predecessor EBBs.
         for ebb in ebbs {
-            // TODO: Ugly hack, we just want the number of predecessors first, and then we can
-            // iterate peacefully over the list.  And the pred_iter wraps the ebb in a BasicBlock
-            // and here we just strip it again; There Must Be A Better Way.
-            let preds: Vec<Ebb> = self.cfg.pred_iter(*ebb).map(|bb| bb.ebb).collect();
+            // TODO: Avoid storage allocation here if possible.
+            let preds: Vec<BB> = self.cfg.pred_iter(*ebb).map(|bb| bb.inst).collect();
             if preds.len() >= 2 {
                 let n = self.ebb_bb(*ebb);
                 let idom_n = self.bb_idom(n).unwrap();
                 for p in preds {
-                    let mut runner = self.ebb_bb(p);
+                    let mut runner = p;
                     while runner != idom_n {
                         df[runner].insert(n);
                         runner = self.bb_idom(runner).unwrap();
