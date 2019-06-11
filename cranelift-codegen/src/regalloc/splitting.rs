@@ -324,7 +324,7 @@ impl<'a> Context<'a> {
                 let use_inst = worklist[i];
                 i += 1;
                 debug!("  Processing {:?}", use_inst);
-                let found =
+                let (found, inserted) =
                     self.find_redefinition(use_inst, r.value, &mut r.new_names, &idf);
                 if let Some(new_defn) = found {
                     // Found a new definition, rename the first use in use_inst with a reference to
@@ -342,10 +342,10 @@ impl<'a> Context<'a> {
                 } else {
                     debug!("No replacement");
                 }
-                // if let Some((phi_name, mut new_uses)) = inserted {
-                //     r.new_names.push(phi_name);
-                //     worklist.append(&mut new_uses);
-                // }
+                if let Some((phi_name, mut new_uses)) = inserted {
+                    r.new_names.push(phi_name);
+                    worklist.append(&mut new_uses);
+                }
             }
         }
     }
@@ -366,9 +366,7 @@ impl<'a> Context<'a> {
     // optionally new uses for the original name in predecessor blocks.
 
     fn find_redefinition(&mut self, use_inst: Inst, name: Value, defns: &mut Vec<Value>, idf: &IDF)
-                         -> Option<Value> {
-//        let dfg = &self.cur.func.dfg;
-
+                         -> (Option<Value>, Option<(Value, Vec<Inst>)>) {
         let use_pp = ExpandedProgramPoint::from(use_inst);
         let use_bb = self.inst_bb(use_inst);
 
@@ -382,45 +380,25 @@ impl<'a> Context<'a> {
             if let Some(found) =
                 self.find_defn_in_bb(defns, target_bb,
                                      if use_bb == target_bb { Some(use_pp) } else { None }) {
-                return Some(found);
+                return (Some(found), None);
             }
 
-            // The target_bb had no definition.  If there's a dominator, then either target_bb is in
-            // the IDF of `name` and we must insert a phi (and use this phi as our result), or we
-            // walk up to target_bb's immediate dominator and search there.
+            // The target_bb had no definition.  Either target_bb is in the IDF of `name` and we
+            // must insert a phi (and use this phi as our result and add the CTIs that target the
+            // phi as new uses), or we walk up to target_bb's immediate dominator and search there.
 
             if idf.contains_key(target_bb) {
+                let mut new_uses = vec![];
+
                 let target_ebb = self.bb_ebb(target_bb);
                 let phi_name = self.cur.func.dfg.append_ebb_param(target_ebb, self.cur.func.dfg.value_type(name));
-                debug!("  New phi name {} in {}", phi_name, target_ebb);
-                defns.push(phi_name);
+
                 for BasicBlock { inst: phi_inst, .. } in self.cfg.pred_iter(target_ebb) {
                     self.cur.func.dfg.append_inst_arg(phi_inst, name);
-                    let found = self.find_redefinition(phi_inst, name, defns, idf);
-                    if let Some(new_defn) = found {
-                        // Found a new definition, rename the first use in use_inst with a reference to
-                        // this definition.
-                        debug!(
-                            "Replace a use of {} with a use of {}",
-                            name, new_defn
-                        );
-                        for arg in self.cur.func.dfg.inst_args_mut(phi_inst) {
-                            if *arg == name {
-                                *arg = new_defn;
-                                break;
-                            }
-                        }
-                    } else {
-                        debug!("No replacement");
-                    }
-                    //new_uses.push(inst);
-                    //debug!("  Name {} added to {:?} for phi name {}", name, inst, phi_name);
+                    new_uses.push(phi_inst);
                 }
 
-                // Probably we do not want this early return...  Hack's algorithm instead updates
-                // the set of defs, and uses recursion to deal with this phi as a new use.
-
-                //return (Some(phi_name), Some((phi_name, new_uses)));
+                return (Some(phi_name), Some((phi_name, new_uses)));
             }
 
             target_bb = self.bb_idom(target_bb).unwrap();
