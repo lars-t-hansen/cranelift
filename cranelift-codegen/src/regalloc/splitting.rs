@@ -531,7 +531,7 @@ impl<'a> Context<'a> {
             while let Some(inst) = self.cur.next_inst() {
                 got_last = false;
                 let op = self.cur.func.dfg[inst].opcode();
-                if op.is_branch() || op.is_return() {
+                if op.is_branch() || op.is_terminator() {
                     bbs.push(inst);
                     got_last = true;
                 }
