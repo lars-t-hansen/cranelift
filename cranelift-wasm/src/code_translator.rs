@@ -37,6 +37,7 @@ use cranelift_codegen::ir::{self, InstBuilder, JumpTableData, MemFlags, ValueLab
 use cranelift_codegen::packed_option::ReservedValue;
 use cranelift_frontend::{FunctionBuilder, Variable};
 use wasmparser::{MemoryImmediate, Operator};
+use std::env;
 
 // Clippy warns about "flags: _" but its important to document that the flags field is ignored
 #[cfg_attr(feature = "cargo-clippy", allow(clippy::unneeded_field_pattern))]
@@ -283,7 +284,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             };
             let val = state.pop1();
             let mut data = JumpTableData::with_capacity(depths.len());
-            if jump_args_count == 0 {
+            if jump_args_count == 0 && !env::var("CALL_SPLITTING").is_ok() {
                 // No jump arguments
                 for depth in &*depths {
                     let ebb = {

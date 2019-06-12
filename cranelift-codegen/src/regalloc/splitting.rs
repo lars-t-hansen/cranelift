@@ -393,7 +393,35 @@ impl<'a> Context<'a> {
                 let target_ebb = self.bb_ebb(target_bb);
                 let phi_name = self.cur.func.dfg.append_ebb_param(target_ebb, self.cur.func.dfg.value_type(name));
 
+                // So, the following doesn't work for indirect_jump_table_br-terminated BBs since
+                // that can't handle parameters.
+                //
+                // In that case, target_ebb should only have one predecessor and so should not be in
+                // the idf and so this should not be an issue. But generated code for box2d violates
+                // this: the default block is jumped to from various other blocks, but also from the
+                // jump table.  Search (from the bottom) for jt0, you'll see
+                //
+                // jt0 = jump_table [ebb90, ebb77, ebb77, ebb77, ebb77, ebb89, ebb77, ebb77, ebb77, ebb88, ebb77, ebb77, ebb87, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb86, ebb77, ebb85, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb84, ebb77, ebb83, ebb77, ebb82, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb81, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb80, ebb77, ebb77, ebb77, ebb77, ebb79, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb77, ebb78]
+                //
+                // and then eg at the end of ebb90,
+                //
+                // @625f [Op1jmpb#eb]                  jump ebb77
+                //
+                // which violates the invariant.  (The invariant is documented various places.)
+                //
+                // Turns out the invariant is more complicated: critical edges are split during
+                // bytecode->ir translation if there are parameters to pass.  This optimization then
+                // precludes adding parameters later.  (code_translator.rs ca line 300)
+                //
+                // To add parameters later, we have to split the critical edges later, or always
+                // assume that we may add parameters later.
+                //
+                // For now, I've "fixed" this in cranelift-wasm by always splitting edges if the
+                // option is enabled for live range splitting across calls.  But this will further
+                // slow down compilation and may generate worse code.
+
                 for BasicBlock { inst: phi_inst, .. } in self.cfg.pred_iter(target_ebb) {
+                    debug!("{}", self.cur.func.dfg[phi_inst].opcode());
                     self.cur.func.dfg.append_inst_arg(phi_inst, name);
                     new_uses.push(phi_inst);
                 }
