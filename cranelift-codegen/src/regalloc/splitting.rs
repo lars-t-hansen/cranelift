@@ -59,7 +59,7 @@ use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
 use crate::entity::{SecondaryMap, SparseMap, SparseMapValue};
 use crate::flowgraph::{BasicBlock, ControlFlowGraph};
-use crate::ir::{Ebb, Function, Inst, InstBuilder, Value, ValueDef};
+use crate::ir::{Ebb, Function, Inst, InstBuilder, Opcode, InstructionData, Value, ValueDef};
 use crate::ir::{ExpandedProgramPoint, ProgramOrder};
 use crate::isa::TargetIsa;
 use crate::regalloc::live_value_tracker::LiveValueTracker;
@@ -421,7 +421,6 @@ impl<'a> Context<'a> {
                 // slow down compilation and may generate worse code.
 
                 for BasicBlock { inst: phi_inst, .. } in self.cfg.pred_iter(target_ebb) {
-                    debug!("{}", self.cur.func.dfg[phi_inst].opcode());
                     self.cur.func.dfg.append_inst_arg(phi_inst, name);
                     new_uses.push(phi_inst);
                 }
@@ -685,6 +684,9 @@ impl<'a> Context<'a> {
             let mut temps = vec![];
             for lv in throughs {
                 if lv.affinity.is_reg() {
+                    if self.is_rematerializable_constant(lv.value) {
+                        continue;
+                    }
                     let temp = self.cur.ins().copy(lv.value);
                     temps.push(temp);
                 }
@@ -697,21 +699,53 @@ impl<'a> Context<'a> {
             let mut i = 0;
             for lv in throughs {
                 if lv.affinity.is_reg() {
-                    let temp = temps[i];
-                    i += 1;
-                    let copy = self.cur.ins().copy(temp);
-                    //let inst = self.cur.built_inst();
+                    let new_ins =
+                        if self.is_rematerializable_constant(lv.value) {
+                            self.rematerialize_constant(lv.value)
+                        } else {
+                            let temp = temps[i];
+                            i += 1;
+                            self.cur.ins().copy(temp)
+                        };
                     if let Some(r) = renamed.get_mut(lv.value) {
-                        r.new_names.push(copy);
+                        r.new_names.push(new_ins);
                     } else {
                         let mut r = RenamedValue::new(lv.value);
-                        r.new_names.push(copy);
+                        r.new_names.push(new_ins);
                         renamed.insert(r);
                     }
                 }
             }
         } else {
             self.cur.next_inst();
+        }
+    }
+
+    fn is_rematerializable_constant(&self, value:Value) -> bool {
+        match self.cur.func.dfg.value_def(value) {
+            ValueDef::Result(inst, _) => match self.cur.func.dfg[inst].opcode() {
+                Opcode::Iconst | Opcode::F32const | Opcode::F64const | Opcode::Bconst => true,
+                _ => false
+            },
+            _ => false
+        }
+    }
+
+    fn rematerialize_constant(&mut self, value:Value) -> Value {
+        let inst = self.cur.func.dfg.value_def(value).unwrap_inst();
+        let id = &self.cur.func.dfg[inst];
+        if let InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } = *id {
+            let ty = self.cur.func.dfg.ctrl_typevar(inst);
+            self.cur.ins().iconst(ty, imm)
+        } else if let InstructionData::UnaryIeee32 { opcode: Opcode::F32const, imm } = *id {
+            self.cur.ins().f32const(imm)
+        } else if let InstructionData::UnaryIeee64 { opcode: Opcode::F64const, imm } = *id {
+            self.cur.ins().f64const(imm)
+        } else if let InstructionData::UnaryBool { opcode: Opcode::Bconst, imm } = *id {
+            let ty = self.cur.func.dfg.ctrl_typevar(inst);
+            self.cur.ins().bconst(ty, imm)
+        } else {
+            unreachable!()
         }
     }
 
