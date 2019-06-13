@@ -207,6 +207,80 @@ impl<'a> BBGraph {
 type IDF = SparseBBSet;
 type AllDF = SecondaryMap<BB, SparseBBSet>;
 
+#[derive(Clone)]
+struct SpilledValue {
+    key: Value,
+    spill: Value
+}
+
+impl SparseMapValue<Value> for SpilledValue {
+    fn key(&self) -> Value {
+        self.key
+    }
+}
+
+impl SpilledValue {
+    fn new(key: Value, spill: Value) -> Self {
+        Self { key, spill }
+    }
+}
+
+struct SpillMap {
+    key: Option<BB>,
+    spills: SparseMap<Value, SpilledValue>
+}
+
+impl SparseMapValue<BB> for SpillMap {
+    fn key(&self) -> BB {
+        self.key.unwrap()
+    }
+}
+
+impl SpillMap {
+    fn new() -> Self {
+        Self {
+            key: None,
+            spills: SparseMap::new()
+        }
+    }
+    fn init_from(&self, other: &SpillMap) -> Self {
+        let mut new_map = SparseMap::new();
+        for x in other.spills.as_slice() {
+            new_map.insert(x.clone());
+        }
+        Self { key: None, spills: new_map }
+    }
+    fn get(&self, v:Value) -> Option<&SpilledValue> {
+        self.spills.get(v)
+    }
+    fn insert(&mut self, v:SpilledValue) {
+        self.spills.insert(v);
+    }
+}
+
+// TODO: This is a terrible data structure because the sets of available temps grow ever larger as
+// we descend the dominator tree.  We really should implement some kind of sharing.  It need not be
+// hard.
+
+struct SpillTracker {
+    maps: SparseMap<BB, SpillMap>
+}
+
+impl SpillTracker {
+    fn new() -> Self {
+        Self {
+            maps: SparseMap::new()
+        }
+    }
+    fn get(&self, bb: BB) -> Option<&SpillMap> {
+        self.maps.get(bb)
+    }
+    fn insert(&mut self, bb: BB, mut spills: SpillMap) {
+        spills.key = Some(bb);
+        self.maps.insert(spills);
+    }
+}
+
 /// Persistent data structures for the splitting pass.
 pub struct Splitting {
 }
@@ -267,6 +341,7 @@ impl<'a> Context<'a> {
 
         let ebbs = self.cur.func.layout.ebbs().collect::<Vec<Ebb>>();
 
+        self.compute_bbgraph(&ebbs);
         self.insert_temps(&mut renamed);
         self.collect_uses(&ebbs, &mut renamed);
 
@@ -279,7 +354,6 @@ impl<'a> Context<'a> {
             );
         }
 
-        self.compute_bbgraph(&ebbs);
         let df = self.compute_dominance_frontiers(&ebbs);
 
         debug!("Basic blocks and dominance frontiers per ebb");
@@ -558,7 +632,7 @@ impl<'a> Context<'a> {
             while let Some(inst) = self.cur.next_inst() {
                 got_last = false;
                 let op = self.cur.func.dfg[inst].opcode();
-                if op.is_branch() || op.is_terminator() {
+                if ends_bb(op) {
                     bbs.push(inst);
                     got_last = true;
                 }
@@ -621,14 +695,15 @@ impl<'a> Context<'a> {
     fn insert_temps(&mut self, renamed: &mut Renamed) {
         // Topo-ordered traversal because we track liveness precisely.
         let mut tracker = LiveValueTracker::new();
+        let mut spill_tracker = SpillTracker::new();
         self.topo.reset(self.cur.func.layout.ebbs());
         while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
-            self.ebb_insert_temps(ebb, renamed, &mut tracker);
+            self.ebb_insert_temps(ebb, renamed, &mut tracker, &mut spill_tracker);
         }
     }
 
     fn ebb_insert_temps(&mut self, ebb: Ebb, renamed: &mut Renamed,
-                        tracker: &mut LiveValueTracker) {
+                        tracker: &mut LiveValueTracker, spill_tracker: &mut SpillTracker) {
         self.cur.goto_top(ebb);
         tracker.ebb_top(
             ebb,
@@ -639,21 +714,33 @@ impl<'a> Context<'a> {
         );
         tracker.drop_dead_params();
 
+        // spills is the spill map for the current BB
+        let mut spills = SpillMap::new();
+        if let Some(idom) = self.domtree.idom(ebb) {
+            if let Some(avail_spills) = spill_tracker.get(idom) {
+                spills.init_from(avail_spills);
+            }
+        }
+
         self.cur.goto_first_inst(ebb);
         while let Some(inst) = self.cur.current_inst() {
             if !self.cur.func.dfg[inst].opcode().is_ghost() {
-                // visit_inst() applies the tracker and advances the instruction
-                self.inst_insert_temps(inst, ebb, renamed, tracker);
+                // inst_insert_temps() applies the tracker and advances the instruction
+                self.inst_insert_temps(inst, ebb, renamed, tracker, &mut spills);
+                if ends_bb(self.cur.func.dfg[inst].opcode()) {
+                    spill_tracker.insert(inst, SpillMap::new().init_from(&spills));
+                }
             } else {
                 let (_throughs, _kills) = tracker.process_ghost(inst);
                 self.cur.next_inst();
             }
+
             tracker.drop_dead(inst);
         }
     }
 
     fn inst_insert_temps(&mut self, inst: Inst, ebb: Ebb, renamed: &mut Renamed,
-                         tracker: &mut LiveValueTracker)
+                         tracker: &mut LiveValueTracker, spills: &mut SpillMap)
     {
         debug_assert_eq!(self.cur.current_inst(), Some(inst));
         debug_assert_eq!(self.cur.current_ebb(), Some(ebb));
@@ -672,10 +759,6 @@ impl<'a> Context<'a> {
         // argument for integrating this splitting into the spilling phase.
         //
         // TODO: This ignores callee-saved registers.
-        //
-        // TODO: We can avoid saving values that can be rematerialized cheaply, namely, constants
-        // and any results of a GlobalValue computation.  In these cases, we must still insert code
-        // after the call (to rematerialize) but no code before the call.
 
         let call_sig = self.cur.func.dfg.call_signature(inst);
         if call_sig.is_some() {
@@ -687,7 +770,16 @@ impl<'a> Context<'a> {
                     if self.is_rematerializable_constant(lv.value) {
                         continue;
                     }
-                    let temp = self.cur.ins().copy(lv.value);
+                    // If we have a spill slot for this name then don't create a new one, but record
+                    // the name of the existing spill slot as the source to use when filling.
+                    let temp =
+                        if let Some(SpilledValue { spill, .. }) = spills.get(lv.value) {
+                            *spill
+                        } else {
+                            let spill_slot = self.cur.ins().copy(lv.value);
+                            spills.insert(SpilledValue::new(lv.value, spill_slot));
+                            spill_slot
+                        };
                     temps.push(temp);
                 }
             }
@@ -778,4 +870,8 @@ impl<'a> Context<'a> {
             }
         }
     }
+}
+
+fn ends_bb(op: Opcode) -> bool {
+    op.is_branch() || op.is_terminator()
 }
