@@ -57,7 +57,7 @@
 
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
-use crate::entity::{SecondaryMap, SparseMap, SparseMapValue};
+use crate::entity::{SecondaryMap, SparseMap, SparseMapValue, SparseSet};
 use crate::flowgraph::{BasicBlock, ControlFlowGraph};
 use crate::ir::{Ebb, Function, Inst, InstBuilder, Opcode, InstructionData, Value, ValueDef};
 use crate::ir::{ExpandedProgramPoint, ProgramOrder};
@@ -281,6 +281,8 @@ impl SpillTracker {
     }
 }
 
+type DefSet = SparseSet<Value>;
+
 /// Persistent data structures for the splitting pass.
 pub struct Splitting {
 }
@@ -341,8 +343,10 @@ impl<'a> Context<'a> {
 
         let ebbs = self.cur.func.layout.ebbs().collect::<Vec<Ebb>>();
 
+        let mut new_defs = DefSet::new();
+
         self.compute_bbgraph(&ebbs);
-        self.insert_temps(&mut renamed);
+        self.insert_temps(&mut renamed, &mut new_defs);
         self.collect_uses(&ebbs, &mut renamed);
 
         debug!("After inserting temps:\n{}", self.cur.func.display(self.cur.isa));
@@ -368,10 +372,17 @@ impl<'a> Context<'a> {
             }
         }
 
-        self.rename_uses(df, renamed);
+        self.rename_uses(df, renamed, &mut new_defs);
+
+        // Here, go through the set of all new definitions and remove all of them from the code -
+        // they were never referenced.
+        for new_def in new_defs.as_slice() {
+            self.cur.goto_inst(self.cur.func.dfg.value_def(*new_def).unwrap_inst());
+            self.cur.remove_inst();
+        }
     }
 
-    fn rename_uses(&mut self, df: AllDF, mut renamed: Renamed) {
+    fn rename_uses(&mut self, df: AllDF, mut renamed: Renamed, new_defs: &mut DefSet) {
 
         // TODO: This feels deeply wrong
         let mut keys = vec![];
@@ -410,6 +421,7 @@ impl<'a> Context<'a> {
                     for arg in self.cur.func.dfg.inst_args_mut(use_inst) {
                         if *arg == r.value {
                             *arg = new_defn;
+                            new_defs.remove(new_defn);
                             break;
                         }
                     }
@@ -692,17 +704,17 @@ impl<'a> Context<'a> {
     // Insert copy-to-temp before a call and copy-from-temp after a call, and retain information
     // about the values that were copied and the names created after the call in `renamed`.
 
-    fn insert_temps(&mut self, renamed: &mut Renamed) {
+    fn insert_temps(&mut self, renamed: &mut Renamed, new_defs: &mut DefSet) {
         // Topo-ordered traversal because we track liveness precisely.
         let mut tracker = LiveValueTracker::new();
         let mut spill_tracker = SpillTracker::new();
         self.topo.reset(self.cur.func.layout.ebbs());
         while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
-            self.ebb_insert_temps(ebb, renamed, &mut tracker, &mut spill_tracker);
+            self.ebb_insert_temps(ebb, renamed, new_defs, &mut tracker, &mut spill_tracker);
         }
     }
 
-    fn ebb_insert_temps(&mut self, ebb: Ebb, renamed: &mut Renamed,
+    fn ebb_insert_temps(&mut self, ebb: Ebb, renamed: &mut Renamed, new_defs: &mut DefSet,
                         tracker: &mut LiveValueTracker, spill_tracker: &mut SpillTracker) {
         self.cur.goto_top(ebb);
         tracker.ebb_top(
@@ -726,7 +738,7 @@ impl<'a> Context<'a> {
         while let Some(inst) = self.cur.current_inst() {
             if !self.cur.func.dfg[inst].opcode().is_ghost() {
                 // inst_insert_temps() applies the tracker and advances the instruction
-                self.inst_insert_temps(inst, ebb, renamed, tracker, &mut spills);
+                self.inst_insert_temps(inst, ebb, renamed, new_defs, tracker, &mut spills);
                 if ends_bb(self.cur.func.dfg[inst].opcode()) {
                     spill_tracker.insert(inst, SpillMap::new().init_from(&spills));
                 }
@@ -739,7 +751,7 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn inst_insert_temps(&mut self, inst: Inst, ebb: Ebb, renamed: &mut Renamed,
+    fn inst_insert_temps(&mut self, inst: Inst, ebb: Ebb, renamed: &mut Renamed, new_defs: &mut DefSet,
                          tracker: &mut LiveValueTracker, spills: &mut SpillMap)
     {
         debug_assert_eq!(self.cur.current_inst(), Some(inst));
@@ -791,7 +803,7 @@ impl<'a> Context<'a> {
             let mut i = 0;
             for lv in throughs {
                 if lv.affinity.is_reg() {
-                    let new_ins =
+                    let new_def =
                         if self.is_rematerializable_constant(lv.value) {
                             self.rematerialize_constant(lv.value)
                         } else {
@@ -799,11 +811,12 @@ impl<'a> Context<'a> {
                             i += 1;
                             self.cur.ins().copy(temp)
                         };
+                    new_defs.insert(new_def);
                     if let Some(r) = renamed.get_mut(lv.value) {
-                        r.new_names.push(new_ins);
+                        r.new_names.push(new_def);
                     } else {
                         let mut r = RenamedValue::new(lv.value);
-                        r.new_names.push(new_ins);
+                        r.new_names.push(new_def);
                         renamed.insert(r);
                     }
                 }
