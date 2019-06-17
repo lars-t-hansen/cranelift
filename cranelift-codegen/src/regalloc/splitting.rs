@@ -351,15 +351,16 @@ impl<'a> Context<'a> {
 
         debug!("After inserting temps:\n{}", self.cur.func.display(self.cur.isa));
 
+/*
         for renamed in renamed.as_slice() {
             debug!(
                 "Renamed\n   {} -> {:?}\n         {:?}",
                 renamed.value, renamed.new_names, renamed.uses
             );
         }
-
+*/
         let df = self.compute_dominance_frontiers(&ebbs);
-
+/*
         debug!("Basic blocks and dominance frontiers per ebb");
         for ebb in &ebbs {
             debug!("{}", *ebb);
@@ -371,7 +372,7 @@ impl<'a> Context<'a> {
                 }
             }
         }
-
+*/
         self.rename_uses(df, renamed, &mut new_defs);
 
         // Here, go through the set of all new definitions and remove all of them from the code -
@@ -400,24 +401,24 @@ impl<'a> Context<'a> {
         // Correct the references to renamed variables and insert phis if necessary.
         for key in &keys {
             let r = renamed.get_mut(*key).unwrap();
-            debug!("Renaming for {}", r.value);
+//            debug!("Renaming for {}", r.value);
             let idf = self.compute_idf(&df, &r.new_names);
-            debug!("  IDF {:?}", idf);
+//            debug!("  IDF {:?}", idf);
             let mut worklist = r.uses.clone(); // Really we should be able to just own this...
             let mut i = 0;
             while i < worklist.len() {
                 let use_inst = worklist[i];
                 i += 1;
-                debug!("  Processing {:?}", use_inst);
+//                debug!("  Processing {:?}", use_inst);
                 let (found, inserted) =
                     self.find_redefinition(use_inst, r.value, &mut r.new_names, &idf);
                 if let Some(new_defn) = found {
                     // Found a new definition, rename the first use in use_inst with a reference to
                     // this definition.
-                    debug!(
-                        "Replace a use of {} with a use of {}",
-                        r.value, new_defn
-                    );
+//                    debug!(
+//                        "Replace a use of {} with a use of {}",
+//                        r.value, new_defn
+//                    );
                     for arg in self.cur.func.dfg.inst_args_mut(use_inst) {
                         if *arg == r.value {
                             *arg = new_defn;
@@ -426,7 +427,7 @@ impl<'a> Context<'a> {
                         }
                     }
                 } else {
-                    debug!("No replacement");
+//                    debug!("No replacement");
                 }
                 if let Some((phi_name, mut new_uses)) = inserted {
                     r.new_names.push(phi_name);
@@ -462,7 +463,7 @@ impl<'a> Context<'a> {
             // If we find an existing definition for one of the defns in target_bb we're done,
             // returning the best such definition.
 
-            debug!("target_bb = {}, use_bb = {}", target_bb, use_bb);
+//            debug!("target_bb = {}, use_bb = {}", target_bb, use_bb);
             if let Some(found) =
                 self.find_defn_in_bb(defns, target_bb,
                                      if use_bb == target_bb { Some(use_pp) } else { None }) {
@@ -531,7 +532,7 @@ impl<'a> Context<'a> {
             if let Some(defn_pp) = self.find_one_defn_in_bb(*defn, target_bb) {
                 if !use_pp.is_some() || layout.cmp(defn_pp, use_pp.unwrap()) == Ordering::Less {
                     if found.is_none() || layout.cmp(max_defn_pp.unwrap(), defn_pp) != Ordering::Greater {
-                        debug!("Updating because better");
+//                        debug!("Updating because better");
                         found = Some(*defn);
                         max_defn_pp = Some(defn_pp);
                     }
@@ -544,15 +545,15 @@ impl<'a> Context<'a> {
         
     fn find_one_defn_in_bb(&self, defn: Value, target_bb: BB) -> Option<ExpandedProgramPoint> {
         let dfg = &self.cur.func.dfg;
-        debug!("Target name = {}", defn);
+//        debug!("Target name = {}", defn);
         let (defn_bb, defn_pp) = match dfg.value_def(defn) {
             ValueDef::Result(defn_inst, _) => {
-                debug!("Defn found as result in {} in {}", defn_inst, self.inst_bb(defn_inst));
+//                debug!("Defn found as result in {} in {}", defn_inst, self.inst_bb(defn_inst));
                 (self.inst_bb(defn_inst),
                  ExpandedProgramPoint::from(defn_inst))
             }
             ValueDef::Param(defn_ebb, _) => {
-                debug!("Defn found as parameter in {} in {}", defn_ebb, self.ebb_bb(defn_ebb));
+//                debug!("Defn found as parameter in {} in {}", defn_ebb, self.ebb_bb(defn_ebb));
                 (self.ebb_bb(defn_ebb), ExpandedProgramPoint::from(defn_ebb))
             }
         };
@@ -795,6 +796,8 @@ impl<'a> Context<'a> {
                     temps.push(temp);
                 }
             }
+
+            println!("Spills: {}", temps.len());
 
             // Move to next instruction so that we can insert copies after the call
             self.cur.next_inst();
