@@ -24,6 +24,7 @@ use crate::loop_analysis::LoopAnalysis;
 use crate::nan_canonicalization::do_nan_canonicalization;
 use crate::postopt::do_postopt;
 use crate::regalloc;
+use crate::rematerialize::do_rematerialize;
 use crate::result::CodegenResult;
 use crate::settings::{FlagsOrIsa, OptLevel};
 use crate::simple_gvn::do_simple_gvn;
@@ -144,6 +145,7 @@ impl Context {
         self.compute_domtree();
         self.eliminate_unreachable_code(isa)?;
         if isa.flags().opt_level() != OptLevel::Fastest {
+            self.rematerialize(isa)?;
             self.dce(isa)?;
         }
         self.regalloc(isa)?;
@@ -232,6 +234,13 @@ impl Context {
     /// Perform pre-legalization rewrites on the function.
     pub fn preopt(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
         do_preopt(&mut self.func, &mut self.cfg);
+        self.verify_if(isa)?;
+        Ok(())
+    }
+
+    /// Move the introduction of some flow-independent values close to their uses.
+    pub fn rematerialize(&mut self, isa: &TargetIsa) -> CodegenResult<()> {
+        do_rematerialize(isa, &mut self.func);
         self.verify_if(isa)?;
         Ok(())
     }

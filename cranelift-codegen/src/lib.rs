@@ -97,6 +97,7 @@ mod postopt;
 mod predicates;
 mod ref_slice;
 mod regalloc;
+mod rematerialize;
 mod result;
 mod scoped_hash_map;
 mod simple_gvn;
