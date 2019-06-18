@@ -11,17 +11,24 @@
 //! unreferenced as a result of rematerialization.  We really need to remove dead phi arguments as
 //! part of dce for this to be truly effective.
 
-// There are several ways of doing this but since the values we replace are flow-independent we can
+// TODO: I see some fp constants are being lowered to load-integer-bits + move-to-fp-reg but this
+// should not be necessary?
+//
+// TODO: Limitations on which values we accept?
+//
+// TODO: This may end up moving integer loads into loops, which may not be what we want.
+//
+// TODO: Can reuse a previous (dominating) constant, if it doesn't lead to spilling...  But this
+// gets us further into regalloc territory.
+
+// There are several ways of doing this, but since the values we replace are flow-independent we can
 // just look at each instruction in turn and if any of its input values are constants (or other
 // simple expressions we can use) we can just create a copy before the instruction and rewrite the
 // instruction.
 //
 // However, if rematerializing the constant has an effect on the flags then we can't do it blindly;
-// we must respect the flags.  This is a little tricky.  If an instruction kills the flags but does
-// not read the flags then we can insert a constant before that instruction; this includes calls.
-// But once the flags are set, arbitrary subsequent instructions in the same ebb can use them, so we
-// can't insert constants again until the flags are once again killed (without being used).
-// Flags are killed at the beginning of the ebb.
+// we must respect the flags.  This is a little tricky, but we can track the state of the flags
+// (dead or alive) and insert constants where the flags are dead.
 
 use crate::cursor::{Cursor, EncCursor};
 use crate::isa::TargetIsa;
@@ -51,7 +58,7 @@ pub fn do_rematerialize(isa: &TargetIsa, func: &mut Function) {
 
             // Compute the effect of the instruction on the flags and move the point if appropriate.
             // There's an assumption here that an instruction that sets the flags does not also read
-            // the flags; this may be too restrictive.
+            // the flags; this may be too restrictive?
             if let Some(constraints) = isa
                 .encoding_info()
                 .operand_constraints(cur.func.encodings[inst])
