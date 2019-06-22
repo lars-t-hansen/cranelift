@@ -33,6 +33,7 @@ use crate::unreachable_code::eliminate_unreachable_code;
 use crate::value_label::{build_value_labels_ranges, ComparableSourceLoc, ValueLabelsRanges};
 use crate::verifier::{verify_context, verify_locations, VerifierErrors, VerifierResult};
 use std::vec::Vec;
+use std::env;
 
 /// Persistent data structures and compilation pipeline.
 pub struct Context {
@@ -310,8 +311,9 @@ impl Context {
 
     /// Run the register allocator.
     pub fn regalloc(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
+        let use_greedy = env::var("GREEDY_REGALLOC").is_ok();
         self.regalloc
-            .run(isa, &mut self.func, &self.cfg, &mut self.domtree)
+            .run(isa, &mut self.func, &self.cfg, &mut self.domtree, use_greedy)
     }
 
     /// Insert prologue and epilogues after computing the stack frame layout.

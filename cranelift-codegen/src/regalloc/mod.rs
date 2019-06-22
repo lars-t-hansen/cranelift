@@ -13,6 +13,7 @@ mod affinity;
 mod coalescing;
 mod context;
 mod diversion;
+mod greedy;
 mod pressure;
 mod reload;
 mod safepoint;

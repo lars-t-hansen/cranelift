@@ -16,6 +16,7 @@ use crate::regalloc::reload::Reload;
 use crate::regalloc::safepoint::emit_stackmaps;
 use crate::regalloc::spilling::Spilling;
 use crate::regalloc::virtregs::VirtRegs;
+use crate::regalloc::greedy::Greedy;
 use crate::result::CodegenResult;
 use crate::timing;
 use crate::topo_order::TopoOrder;
@@ -33,6 +34,7 @@ pub struct Context {
     spilling: Spilling,
     reload: Reload,
     coloring: Coloring,
+    greedy: Greedy,
 }
 
 impl Context {
@@ -50,6 +52,7 @@ impl Context {
             spilling: Spilling::new(),
             reload: Reload::new(),
             coloring: Coloring::new(),
+            greedy: Greedy::new(),
         }
     }
 
@@ -63,6 +66,7 @@ impl Context {
         self.spilling.clear();
         self.reload.clear();
         self.coloring.clear();
+        self.greedy.clear();
     }
 
     /// Current values liveness state.
@@ -80,18 +84,12 @@ impl Context {
         func: &mut Function,
         cfg: &ControlFlowGraph,
         domtree: &mut DominatorTree,
+        use_greedy: bool,
     ) -> CodegenResult<()> {
         let _tt = timing::regalloc();
         debug_assert!(domtree.is_valid());
 
         let mut errors = VerifierErrors::default();
-
-        // `Liveness` and `Coloring` are self-clearing.
-        self.virtregs.clear();
-
-        // Tracker state (dominator live sets) is actually reused between the spilling and coloring
-        // phases.
-        self.tracker.clear();
 
         // Pass: Liveness analysis.
         self.liveness.compute(isa, func, cfg);
@@ -103,6 +101,38 @@ impl Context {
                 return Err(errors.into());
             }
         }
+
+        let errors =
+            if use_greedy {
+                self.greedy(isa, func, cfg, domtree, errors)?
+            } else {
+                self.graph_coloring(isa, func, cfg, domtree, errors)?
+            };
+
+        // Even if we arrive here, (non-fatal) errors might have been reported, so we
+        // must make sure absolutely nothing is wrong
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.into())
+        }
+    }
+
+    fn graph_coloring(
+        &mut self,
+        isa: &TargetIsa,
+        func: &mut Function,
+        cfg: &ControlFlowGraph,
+        domtree: &mut DominatorTree,
+        mut errors: VerifierErrors,
+    ) -> CodegenResult<VerifierErrors> {
+
+        // `Liveness` and `Coloring` are self-clearing.
+        self.virtregs.clear();
+
+        // Tracker state (dominator live sets) is actually reused between the spilling and coloring
+        // phases.
+        self.tracker.clear();
 
         // Pass: Coalesce and create Conventional SSA form.
         self.coalescing.conventional_ssa(
@@ -226,12 +256,39 @@ impl Context {
             }
         }
 
-        // Even if we arrive here, (non-fatal) errors might have been reported, so we
-        // must make sure absolutely nothing is wrong
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.into())
+        Ok(errors)
+    }
+
+    fn greedy(
+        &mut self,
+        isa: &TargetIsa,
+        func: &mut Function,
+        cfg: &ControlFlowGraph,
+        domtree: &mut DominatorTree,
+        mut errors: VerifierErrors,
+    ) -> CodegenResult<VerifierErrors> {
+
+        self.tracker.clear();
+
+        self.greedy.run(
+            isa,
+            func,
+            cfg,
+            domtree,
+            &mut self.liveness,
+            &mut self.topo,
+            &mut self.tracker,
+        );
+
+        if isa.flags().enable_verifier() {
+            let ok = verify_context(func, cfg, domtree, isa, &mut errors).is_ok()
+                && verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok()
+                && verify_locations(isa, func, Some(&self.liveness), &mut errors).is_ok();
+            if !ok {
+                return Err(errors.into());
+            }
         }
+
+        Ok(errors)
     }
 }
