@@ -13,14 +13,14 @@ mod affinity;
 mod coalescing;
 mod context;
 mod diversion;
-mod greedy;
+mod minimal;
 mod pressure;
 mod reload;
 mod safepoint;
 mod solver;
 mod spilling;
 
-pub use self::context::Context;
+pub use self::context::{Context, Mechanism};
 pub use self::diversion::RegDiversions;
 pub use self::register_set::RegisterSet;
 pub use self::safepoint::emit_stackmaps;

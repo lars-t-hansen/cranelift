@@ -16,7 +16,7 @@ use crate::regalloc::reload::Reload;
 use crate::regalloc::safepoint::emit_stackmaps;
 use crate::regalloc::spilling::Spilling;
 use crate::regalloc::virtregs::VirtRegs;
-use crate::regalloc::greedy::Greedy;
+use crate::regalloc::minimal::Minimal;
 use crate::result::CodegenResult;
 use crate::timing;
 use crate::topo_order::TopoOrder;
@@ -34,7 +34,12 @@ pub struct Context {
     spilling: Spilling,
     reload: Reload,
     coloring: Coloring,
-    greedy: Greedy,
+    minimal: Minimal,
+}
+
+pub enum Mechanism {
+    Minimal,
+    Coloring
 }
 
 impl Context {
@@ -52,7 +57,7 @@ impl Context {
             spilling: Spilling::new(),
             reload: Reload::new(),
             coloring: Coloring::new(),
-            greedy: Greedy::new(),
+            minimal: Minimal::new(),
         }
     }
 
@@ -66,7 +71,7 @@ impl Context {
         self.spilling.clear();
         self.reload.clear();
         self.coloring.clear();
-        self.greedy.clear();
+        self.minimal.clear();
     }
 
     /// Current values liveness state.
@@ -84,7 +89,7 @@ impl Context {
         func: &mut Function,
         cfg: &ControlFlowGraph,
         domtree: &mut DominatorTree,
-        use_greedy: bool,
+        mechanism: Mechanism,
     ) -> CodegenResult<()> {
         let _tt = timing::regalloc();
         debug_assert!(domtree.is_valid());
@@ -103,10 +108,11 @@ impl Context {
         }
 
         let errors =
-            if use_greedy {
-                self.greedy(isa, func, cfg, domtree, errors)?
-            } else {
-                self.graph_coloring(isa, func, cfg, domtree, errors)?
+            match mechanism {
+                Mechanism::Minimal => 
+                    self.minimal(isa, func, cfg, domtree, errors)?,
+                Mechanism::Coloring =>
+                    self.graph_coloring(isa, func, cfg, domtree, errors)?
             };
 
         // Even if we arrive here, (non-fatal) errors might have been reported, so we
@@ -259,7 +265,7 @@ impl Context {
         Ok(errors)
     }
 
-    fn greedy(
+    fn minimal(
         &mut self,
         isa: &TargetIsa,
         func: &mut Function,
@@ -270,7 +276,7 @@ impl Context {
 
         self.tracker.clear();
 
-        self.greedy.run(
+        self.minimal.run(
             isa,
             func,
             cfg,

@@ -92,14 +92,14 @@ impl SparseMapValue<Value> for SpillInfo
 }
 
 /// Register allocator state.
-pub struct Greedy {
+pub struct Minimal {
     spills: SpillMap
 }
 
-impl Greedy {
+impl Minimal {
     /// Create a new register allocator state.
     pub fn new() -> Self {
-        Greedy {
+        Self {
             spills: SpillMap::new()
         }
     }
@@ -109,7 +109,7 @@ impl Greedy {
         self.spills.clear();
     }
 
-    // Greedy register allocator v0.
+    // Minimal register allocator.
     //
     // Here, every value is on the stack always except right before an instruction that uses the
     // value.  This is just an exercise to learn how to process the input and create correct output.

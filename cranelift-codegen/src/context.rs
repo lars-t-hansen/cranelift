@@ -311,9 +311,12 @@ impl Context {
 
     /// Run the register allocator.
     pub fn regalloc(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
-        let use_greedy = env::var("GREEDY_REGALLOC").is_ok();
+        let mechanism = match env::var("GREEDY_REGALLOC") {
+            Ok(_) => regalloc::Mechanism::Minimal,
+            Err(_) => regalloc::Mechanism::Coloring
+        };
         self.regalloc
-            .run(isa, &mut self.func, &self.cfg, &mut self.domtree, use_greedy)
+            .run(isa, &mut self.func, &self.cfg, &mut self.domtree, mechanism)
     }
 
     /// Insert prologue and epilogues after computing the stack frame layout.
