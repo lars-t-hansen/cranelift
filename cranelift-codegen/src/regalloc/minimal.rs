@@ -3,16 +3,18 @@
 //! Every function operates on a set of values, and at run time each value has a single home
 //! location for its entire lifetime (a specific hardware register or a specific stack slot).  The
 //! job of the register allocator is to compute that home location for every value and record the
-//! locations in the function's `locations` array; subsequent machine code encoding will use that
-//! array as the source of truth for each value's location when the encoding needs to know it.  In
-//! the process, the allocator may create additional temporary values; it must record the locations
-//! for those values too.  The register allocator also must allocate any necessary stack slots.
+//! locations in the function's `locations` array; subsequent translation of the IR to machine code
+//! will use that array as the source of truth for each value's location.  In the process of
+//! creating the allocation, the allocator may create additional temporary values; it must record
+//! the locations for those values too.  The register allocator also must allocate any necessary
+//! stack slots.
 //!
-//! The `minimal` allocator assigns every value to a unique stack slot, then moves values into
-//! registers only as required by each instruction, and finally moves any defined values out of
-//! registers directly after the instruction.  It must handle the function ABI and two-address
-//! operations (tied registers) and must obey all instruction constraints (eg fixed registers), but
-//! is otherwise the simplest register allocator imaginable for our given IR structure.
+//! The `minimal` register allocator assigns every incoming IR value to a unique stack slot, then
+//! moves values into registers only as required by each instruction, and finally moves any values
+//! defined by the instruction out of registers directly after the instruction.  It must handle the
+//! function ABI and two-address operations (tied registers) and must obey all instruction
+//! constraints (eg fixed registers and register classes), but is otherwise the simplest register
+//! allocator imaginable for our given IR structure.
 
 // Overview.
 //
@@ -41,7 +43,8 @@
 //
 // At the start of each instruction, we have a set of available registers for each register class.
 // We first process any fixed constraints.  Then we allocate the rest.
-
+//
+// We do not reuse stack slots (yet).
 
 // Some notes.
 //
@@ -49,7 +52,7 @@
 //   about killing anything.
 //
 // - I think there should be no fallthrough instructions at this point in the pipeline, we
-//   should assert that.
+//   should assert that.  NOT TRUE.  I see fallthrough_return in the code given to the regalloc.
     
 
 // ==============================================================================================
@@ -168,12 +171,14 @@ use crate::flowgraph::ControlFlowGraph;
 use crate::cursor::{Cursor, EncCursor};
 use crate::entity::{SparseMap, SparseMapValue};
 use crate::dominator_tree::DominatorTree;
-use crate::ir::{ArgumentLoc, Ebb, Function, Inst, InstBuilder, SigRef, Value, ValueLoc, StackSlot};
+use crate::ir::{self, ArgumentLoc, Ebb, Function, Inst, InstBuilder, Opcode, SigRef, Value, ValueLoc, StackSlot};
 use crate::isa::registers::{RegClass, RegClassIndex, RegClassMask, RegUnit};
 use crate::isa::{ConstraintKind, EncInfo, RecipeConstraints, RegInfo, TargetIsa};
 use crate::regalloc::live_value_tracker::{LiveValue, LiveValueTracker};
 use crate::regalloc::liveness::Liveness;
+use crate::regalloc::register_set::RegisterSet;
 use crate::topo_order::TopoOrder;
+use std::process;
 
 /// Map from a name in the original program to information about where it's spilled.
 type SpillMap = SparseMap<Value, SpillInfo>;
@@ -220,7 +225,10 @@ impl Minimal {
                _tracker: &mut LiveValueTracker,
     ) {
         let mut ctx = Context {
+            usable_regs: isa.allocatable_registers(func),
             cur: EncCursor::new(func, isa),
+            reginfo: isa.register_info(),
+            encinfo: isa.encoding_info(),
             domtree,
             topo,
         };
@@ -229,8 +237,16 @@ impl Minimal {
 }
 
 struct Context<'a> {
+    // Set of registers that the allocator can use.
+    usable_regs: RegisterSet,
+
     // Current instruction as well as reference to function and ISA.
     cur: EncCursor<'a>,
+
+    // Cached ISA information.
+    // We save it here to avoid frequent virtual function calls on the `TargetIsa` trait object.
+    reginfo: RegInfo,
+    encinfo: EncInfo,
 
     // References to contextual data structures we need.
     domtree: &'a DominatorTree,
@@ -239,120 +255,143 @@ struct Context<'a> {
 
 impl<'a> Context<'a> {
     fn run(&mut self) {
-        // Define spill slots for all EBB parameters so that we can process control transfers.
-        self.topo.reset(self.cur.func.layout.ebbs());
-        while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
-            self.make_spill_slots_for_ebb_params(ebb);
-        }
+        // For the entry block, spill register parameters to the stack while retaining their names.
+        self.visit_entry_block(self.cur.func.layout.entry_block().unwrap());
 
-        // Insert explicit spills for ebb0?
-        let entry = self.topo.next(&self.cur.func.layout, self.domtree).unwrap();
-        debug_assert!(self.cur.func.layout.entry_block() == Some(entry));
-        self.visit_entry_header(entry);
+        // For all blocks other than the entry block, assign stack slots to all block parameters so
+        // that we can later process control transfer instructions.
+        self.visit_other_blocks();
 
-        // Process all instructions.  Fill any register args before the instruction and spill any
-        // definitions after.
+        // Process all instructions in domtree order so that we'll always know the location of a
+        // definition when we see its use.  Fill any register args before the instruction and spill
+        // any definitions after.
         self.topo.reset(self.cur.func.layout.ebbs());
         while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
             self.cur.goto_top(ebb);
             while let Some(inst) = self.cur.next_inst() {
+                // TODO: what about ghost instructions?!  Do we ignore them, or are they important
+                // somehow for register allocation?
                 if !self.cur.func.dfg[inst].opcode().is_ghost() {
                     self.visit_inst(inst);
                 }
             }
         }
+
+        dbg!(&self.cur.func);
     }
 
-    // Spill any entry block parameters that are in registers.
-    fn visit_entry_params(&mut self, ebb: Ebb) {
-        self.cur.goto_first_inst(ebb);
-        for (arg, abi) in self.cur.func.dfg.ebb_params(ebb).zip(self.cur.func.signature.params.into_iter()) {
-            match abi.location {
-                ArgumentLoc::Reg(r) => {
-                    // I think this isn't right, we really want to emit spill() operations here.  regspill()
-                    // is lower level than we need.  But at the same time, we must have a stack slot for the
-                    // location!
-                    //
-                    // spill_reg in spilling.rs seems pertinent here, together with code in
-                    // reload.rs -- the code in spilling.rs creates a spill slot for that spill and
-                    // records this in the affinity, and then reload.rs triggers on the affinity and
-                    // inserts a spill instruction.
-                    //
-                    // still not clear to me how that is later acted on, but those spill instructions can
-                    // be lowered directly to machine code.
-                    let ty = self.cur.func.dfg.value_type(arg);
-                    let ss = self.cur.func.stack_slots.make_spill_slot(ty);
-                    let spill = self.cur.ins().regspill(arg, r, ss);
-                    let spilled_name = self.cur.func.dfg.first_result(spill);
-                    self.spills.insert(SpillInfo { program_name: arg, spilled_name });
+    fn visit_entry_block(&mut self, entry: Ebb) {
+        // TODO: Presumably there's some form of collect() that makes this easy.
+        let mut siginfo = vec![];
+        for (param, abi) in self.cur.func.dfg.ebb_params(entry).iter().zip(&self.cur.func.signature.params) {
+            siginfo.push((*param, *abi));
+        }
 
-                    debug_assert!(self.cur.func.locations[spilled_name] == ValueLoc::Unassigned);
-                    self.cur.func.locations[spilled_name] = ValueLoc::Stack(ss);
+        self.cur.goto_first_inst(entry);
+        for (param, abi) in siginfo {
+            match abi.location {
+                ArgumentLoc::Reg(reg) => {
+                    let new_param = self
+                        .cur
+                        .func
+                        .dfg
+                        .replace_ebb_param(param, abi.value_type);
+                    self.cur.func.locations[new_param] = ValueLoc::Reg(reg);
+                    self.cur.ins().with_result(param).spill(new_param);
+
+                    let ss = self.cur.func.stack_slots.make_spill_slot(abi.value_type);
+                    self.cur.func.locations[param] = ValueLoc::Stack(ss);
                 }
-                ArgumentLoc::Stack(_) => {}
-                ArgumentLoc::Unassigned => panic!("Unexpected ABI location"),
+                ArgumentLoc::Stack(offset) => {
+                    // Incoming stack arguments have sensible pre-initialized locations.
+                    debug_assert!(if let ValueLoc::Stack(_ss) = self.cur.func.locations[param] { true } else { false });
+                }
+                ArgumentLoc::Unassigned => {
+                    panic!("Should not happen");
+                }
             }
         }
     }
+    
+    fn visit_other_blocks(&mut self) {
+        let entry = self.cur.func.layout.entry_block().unwrap();
+        self.topo.reset(self.cur.func.layout.ebbs());
 
-    fn make_spill_slots_for_ebb_params(&mut self, ebb: Ebb) {
-/*
-        for p in self.cur.func.dfg.ebb_params(ebb) {
-            self.make_spill_slot_for_defn(*p)
-        }        
-*/
-    }
+        // Skip the entry block.
+        let first = self.topo.next(&self.cur.func.layout, self.domtree).unwrap();
+        debug_assert!(first == entry);
 
-    fn make_spill_slot_for_defn(&mut self, value:Value) {
-/*
-        if Some(slot) = self.slots.get(value) {
-            slot
-        } else {
-            let ty = self.cur.func.dfg.value_type(value);
-            let slot = self.cur.func.stack_slots.make_spill_slot(ty);
-            self.slots.insert(SpillInfo { name: value, spill_name: slot, ..});
-            slot
-        }
-*/
-    }
-
-    // the entry block actually has register inputs, so must be processed specially.
-    fn visit_entry_header(&mut self, ebb: Ebb) {
-//        for each parameter register, spill it;
-//        but how do we remember where it is so that we can later fill it?            
-//        
-/*
-        debug_assert_eq!(self.cur.func.signature.params.len(), args.len());
-        self.cur.goto_first_inst(ebb);
-
-        for (arg_idx, arg) in args.iter().enumerate() {
-            let abi = self.cur.func.signature.params[arg_idx];
-            match abi.location {
-                ArgumentLoc::Reg(_) => {
-                    if arg.affinity.is_stack() {
-                        // An incoming register parameter was spilled. Replace the parameter value
-                        // with a temporary register value that is immediately spilled.
-                        let reg = self
-                            .cur
-                            .func
-                            .dfg
-                            .replace_ebb_param(arg.value, abi.value_type);
-                        let affinity = Affinity::abi(&abi, self.cur.isa);
-                        self.liveness.create_dead(reg, ebb, affinity);
-                        self.insert_spill(ebb, arg.value, reg);
-                    }
-                }
-                ArgumentLoc::Stack(_) => {
-                    debug_assert!(arg.affinity.is_stack());
-                }
-                ArgumentLoc::Unassigned => panic!("Unexpected ABI location"),
+        while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
+            for param in self.cur.func.dfg.ebb_params(ebb) {
+                let ss = self.cur.func.stack_slots.make_spill_slot(self.cur.func.dfg.value_type(*param));
+                self.cur.func.locations[*param] = ValueLoc::Stack(ss);
             }
         }
-*/
     }
 
     fn visit_inst(&mut self, inst: Inst) {
-        // If it's a cti, then 
+        let mut regs = self.usable_regs.clone();
+        let opcode = self.cur.func.dfg[inst].opcode();
+        if opcode == Opcode::Copy || opcode == Opcode::CopySpecial {
+            // Replace with fill/spill pair
+            panic!("Copy instruction not yet implemented");
+        } else if opcode.is_branch() {
+            // IndirectJumpTableBr does not take parameters
+            //
+            // For the others: Insert fill/spills where the spills target the already-assigned
+            // locations of the target ebb parameters.
+            //
+            // For fallthrough, we must know the layout successor for the block to handle the
+            // arguments correctly, so that's a little tricky?  See fallthroughs() in relaxation.js
+            panic!("Branches not yet implemented");
+        } else if opcode.is_terminator() {
+            // Fallthrough and IndirectJumpTableBr and Jump are handled as branches
+            // BrTable is not here, it's removed during legalization.
+            // FallthroughReturn and Return take ABI parameters
+            // Trap I'm not sure about
+            panic!("Terminators not yet implemented");
+        } else if opcode.is_call() {
+            // Have to set up outgoing parameters according to ABI
+            panic!("Calls not yet implemented");
+        } else if opcode == Opcode::Regmove || opcode == Opcode::Regfill || opcode == Opcode::Regspill {
+            panic!("Unexpected opcodes");
+        } else {
+            // Vanilla instruction
+            let args = self.cur.func.dfg.inst_args(inst);
+            let enc = self.cur.func.encodings[inst];
+            let constraints = self.encinfo.operand_constraints(enc);
+            if let Some(constraints) = constraints {
+                if constraints.fixed_ins {
+                    panic!("Not supporting fixed_ins yet");
+                }
+                if constraints.tied_ops {
+                    panic!("Not supporting tied_ops yet");
+                }
+            }
+//        let replacements = vec![];
+            for arg in args {
+                if let ValueLoc::Stack(ss) = self.cur.func.locations[*arg] {
+                    //self.cur.goto_inst(inst);
+                    //let reg = <allocate some register of the correct type from a set>;
+                    //self.cur.func.locations[new_arg] = ValueLoc::Reg(reg);
+                    //let new_arg = self.cur.ins().fill(*arg);
+                    // TODO: replace the parameter in the instruction with this value
+                }
+            }
+
+//        dbg!(self.cur.func.dfg.inst_results(inst));
+
+            if let Some(constraints) = constraints {
+                if constraints.fixed_outs {
+                    panic!("Not supporting fixed_outs yet");
+                }
+                if constraints.tied_ops {
+                    panic!("Not supporting tied_ops yet");
+                }
+            }
+
+        }
+
 /*
         let defs = ...;
         for def in defs {

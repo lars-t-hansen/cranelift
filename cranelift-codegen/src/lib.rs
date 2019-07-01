@@ -54,6 +54,8 @@ extern crate std;
 use hashmap_core::{map as hash_map, HashMap, HashSet};
 #[cfg(feature = "std")]
 use std::collections::{hash_map, HashMap, HashSet};
+#[macro_use]
+extern crate log;
 
 pub use crate::context::Context;
 pub use crate::legalizer::legalize_function;

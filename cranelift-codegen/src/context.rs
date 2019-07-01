@@ -311,7 +311,7 @@ impl Context {
 
     /// Run the register allocator.
     pub fn regalloc(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
-        let mechanism = match env::var("GREEDY_REGALLOC") {
+        let mechanism = match env::var("MINIMAL_REGALLOC") {
             Ok(_) => regalloc::Mechanism::Minimal,
             Err(_) => regalloc::Mechanism::Coloring
         };
