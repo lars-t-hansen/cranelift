@@ -46,15 +46,6 @@
 //
 // We do not reuse stack slots (yet).
 
-// Some notes.
-//
-// - Since we keep no live values in registers, tied arguments are easy: we don't have to worry
-//   about killing anything.
-//
-// - I think there should be no fallthrough instructions at this point in the pipeline, we
-//   should assert that.  NOT TRUE.  I see fallthrough_return in the code given to the regalloc.
-    
-
 // ==============================================================================================
 // Sundry notes about how things hang together in Cranelift, not specific to this allocator.
 // ==============================================================================================
@@ -125,7 +116,7 @@
 //
 // => reload.rs has a lot of relevant code here
 //
-// 
+//
 // About two-address instructions:
 //
 // These are expressed as tied operands to an instruction, I think - output is tied to one of the
@@ -140,7 +131,7 @@
 // Flags may complicate fills and spills -- these must not affect the flags, but is that so?  Since
 // we can set and read flags independently, are there limits on how long those flags are good?  I
 // expect not...
-// 
+//
 //
 //
 // About control flow joins:
@@ -172,10 +163,10 @@
 // The register sets are really quite complex.  Some of this complexity deals with overlapping
 // registers (which are endemic); some deals with asymmetric register sets in some CPUs (eg ARM).
 //
-// A `register unit` is an allocatable register but carries also information about whether it
+// A `register unit` is an allocatable register but also carries information about whether it
 // overlaps multiple hardware registers.  The units are allocated from disjoint `register banks`,
-// which provide registers for one or more `register classes`; top-level classes are disjoint but
-// classes can be nested inside others.
+// which provide registers for one or more `register classes`; top-level classes are disjoint (do
+// they correspond 1:1 to the banks?) but some classes can be nested inside others.
 //
 // An instruction encoding's operand is allocated with constraints on the encoding, and for an
 // encoding that requires the operand to be in a register the encoding holds the desired register
@@ -187,12 +178,41 @@
 // from `index` if the class is nested).  Possibly these can be used to index into tables that
 // mirror the RegInfo table.
 //
-// 
+// A `register set` is a set of all available registers, obtained from the ISA.  It has methods for
+// taking and releasing and querying the availability of *specific* registers in a class, and for
+// iterating across the available registers of a class.  The iterator does not reference the set,
+// but copies its contents.
+//
+// When we allocate a register, we are given a register class (from the encoding's constraint) and
+// want to get a register of that class from the register set.
+//
+// Given all this complexity, getting a free register for a class can be fairly expensive, notably
+// since getting a register of one class may also affect the availability of registers of other
+// classes.  It may well be true that the common case is that there are no such interferences, but
+// there still seems to be significant administrative overhead.
+//
+// The best bet may be this:
+//
+// - at the outset, enumerate the register classes, and for each class, create an iterator, and
+//   iterate across all the free registers in the class given the initial set of available registers
+//   from the isa.  Store these registers in a per-class data structure.
+// - when allocating a register for a class, consult this data structure: take a value from it,
+//   test its availability against the register set, and if it is available, obtain it (and remove it
+//   from the data structure); otherwise move on to the next value in the data structure.
+//   usually this will succeed on the first try.
+// - when freeing a register for a class, return it to the register set and to the data structure.
+// - the we fail to obtain a register we'd like to deprioritize it; so move it elsewhere in the
+//   data structure, maybe, or use a roving pointer for allocation?
 
-use crate::flowgraph::ControlFlowGraph;
+use std::vec::Vec;
+
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
-use crate::ir::{self, ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode, SigRef, Value, ValueLoc, StackSlot};
+use crate::flowgraph::ControlFlowGraph;
+use crate::ir::{
+    self, ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode, SigRef,
+    StackSlot, Value, ValueLoc,
+};
 use crate::isa::registers::{RegClass, RegClassIndex, RegClassMask, RegUnit};
 use crate::isa::{ConstraintKind, EncInfo, RecipeConstraints, RegInfo, TargetIsa};
 use crate::regalloc::live_value_tracker::LiveValueTracker;
@@ -202,28 +222,27 @@ use crate::topo_order::TopoOrder;
 use std::process;
 
 /// Register allocator state.
-pub struct Minimal {
-}
+pub struct Minimal {}
 
 impl Minimal {
     /// Create a new register allocator state.
     pub fn new() -> Self {
-        Self { }
+        Self {}
     }
 
     /// Clear the state of the allocator.
-    pub fn clear(&mut self) {
-    }
+    pub fn clear(&mut self) {}
 
     /// Run register allocation.
-    pub fn run(&mut self,
-               isa: &TargetIsa,
-               func: &mut Function,
-               cfg: &ControlFlowGraph,
-               domtree: &mut DominatorTree,
-               _liveness: &mut Liveness,
-               topo: &mut TopoOrder,
-               _tracker: &mut LiveValueTracker,
+    pub fn run(
+        &mut self,
+        isa: &TargetIsa,
+        func: &mut Function,
+        cfg: &ControlFlowGraph,
+        domtree: &mut DominatorTree,
+        _liveness: &mut Liveness,
+        topo: &mut TopoOrder,
+        _tracker: &mut LiveValueTracker,
     ) {
         let mut ctx = Context {
             usable_regs: isa.allocatable_registers(func),
@@ -232,9 +251,37 @@ impl Minimal {
             encinfo: isa.encoding_info(),
             domtree,
             topo,
-            cfg
+            cfg,
         };
         ctx.run()
+    }
+}
+
+struct Regs {
+    registers: RegisterSet,
+}
+
+impl Regs {
+    fn new(registers: RegisterSet) -> Self {
+        Self { registers }
+    }
+
+    fn take_specific(&mut self, rc: RegClass, r: RegUnit) {
+        self.registers.take(rc, r);
+    }
+
+    fn take(&mut self, rc: RegClass) -> Option<RegUnit> {
+        // FIXME: This is probably quite slow.
+        let mut i = self.registers.iter(rc);
+        let r = i.next();
+        if r.is_some() {
+            self.registers.take(rc, r.unwrap());
+        }
+        r
+    }
+
+    fn free(&mut self, rc: RegClass, r: RegUnit) {
+        self.registers.free(rc, r);
     }
 }
 
@@ -271,6 +318,7 @@ impl<'a> Context<'a> {
         // definition when we see its use.  Fill any register args before the instruction and spill
         // any definitions after.
 
+        let mut regs = Regs::new(self.usable_regs.clone());
         self.topo.reset(self.cur.func.layout.ebbs());
         while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
             self.cur.goto_top(ebb);
@@ -278,18 +326,27 @@ impl<'a> Context<'a> {
                 // TODO: what about ghost instructions?!  Do we ignore them, or are they important
                 // somehow for register allocation?
                 if !self.cur.func.dfg[inst].opcode().is_ghost() {
-                    self.visit_inst(inst);
+                    self.visit_inst(inst, &mut regs);
                 }
             }
         }
 
         dbg!(&self.cur.func);
+        dbg!(&self.cur.func.locations);
+        process::exit(0);
     }
 
     fn visit_entry_block(&mut self, entry: Ebb) {
         // TODO: Presumably there's some form of collect() that makes this easy.
         let mut siginfo = vec![];
-        for (param, abi) in self.cur.func.dfg.ebb_params(entry).iter().zip(&self.cur.func.signature.params) {
+        for (param, abi) in self
+            .cur
+            .func
+            .dfg
+            .ebb_params(entry)
+            .iter()
+            .zip(&self.cur.func.signature.params)
+        {
             siginfo.push((*param, *abi));
         }
 
@@ -297,11 +354,7 @@ impl<'a> Context<'a> {
         for (param, abi) in siginfo {
             match abi.location {
                 ArgumentLoc::Reg(reg) => {
-                    let new_param = self
-                        .cur
-                        .func
-                        .dfg
-                        .replace_ebb_param(param, abi.value_type);
+                    let new_param = self.cur.func.dfg.replace_ebb_param(param, abi.value_type);
                     self.cur.func.locations[new_param] = ValueLoc::Reg(reg);
                     self.cur.ins().with_result(param).spill(new_param);
 
@@ -310,7 +363,13 @@ impl<'a> Context<'a> {
                 }
                 ArgumentLoc::Stack(_offset) => {
                     // Incoming stack arguments have sensible pre-initialized locations.
-                    debug_assert!(if let ValueLoc::Stack(_ss) = self.cur.func.locations[param] { true } else { false });
+                    debug_assert!(
+                        if let ValueLoc::Stack(_ss) = self.cur.func.locations[param] {
+                            true
+                        } else {
+                            false
+                        }
+                    );
                 }
                 ArgumentLoc::Unassigned => {
                     panic!("Should not happen");
@@ -318,7 +377,7 @@ impl<'a> Context<'a> {
             }
         }
     }
-    
+
     fn visit_other_blocks(&mut self) {
         let entry = self.cur.func.layout.entry_block().unwrap();
         self.topo.reset(self.cur.func.layout.ebbs());
@@ -329,14 +388,17 @@ impl<'a> Context<'a> {
 
         while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
             for param in self.cur.func.dfg.ebb_params(ebb) {
-                let ss = self.cur.func.stack_slots.make_spill_slot(self.cur.func.dfg.value_type(*param));
+                let ss = self
+                    .cur
+                    .func
+                    .stack_slots
+                    .make_spill_slot(self.cur.func.dfg.value_type(*param));
                 self.cur.func.locations[*param] = ValueLoc::Stack(ss);
             }
         }
     }
 
-    fn visit_inst(&mut self, inst: Inst) {
-        let mut regs = self.usable_regs.clone();
+    fn visit_inst(&mut self, inst: Inst, regs: &mut Regs) {
         let opcode = self.cur.func.dfg[inst].opcode();
         if opcode == Opcode::Copy || opcode == Opcode::CopySpecial {
             // Replace with fill/spill pair
@@ -371,24 +433,46 @@ impl<'a> Context<'a> {
                     panic!("Unexpected trigger for is_branch");
                 }
             } {
-                // If the jump is taken then insert fill/spills where the spills target the
-                // already-assigned locations of the target ebb parameters.  For conditional
-                // branches along critical edges this means rewriting the code: we must insert a new
-                // ebb to hold the copies and perform a jump, and the conditional branch must have
-                // its parameters removed and the target changed to the new ebb.
-                let split_critical = side_exit && self.has_multiple_predecessors(target);
-                if split_critical {
-                    panic!("Critical edge splitting not yet implemented");
+                let new_block = side_exit && self.cur.func.dfg.ebb_params(target).len() > 0;
+                if new_block {
+                    // For conditional branches we must insert the fill/spill along the taken edge
+                    // only.  This means we must always insert a new block to hold the new code
+                    // (even if the edge is non-critical) because the values must be in the correct
+                    // stack slots for the ebb parameters when the target block is entered.  The
+                    // branch is rewritten to branch to this new block without parameters; the new
+                    // block performs the copies and then jumps unconditionally to the target block.
+                    panic!("Conditional branches with new block not yet handled.")
                 }
-                // For fill/spill we must know how to allocate registers...
-                panic!("Branches/jumps not yet implemented");
+
+                let arginfo: Vec<_> = self
+                    .cur
+                    .func
+                    .dfg
+                    .ebb_params(target)
+                    .iter()
+                    .zip(self.cur.func.dfg.inst_args(inst).iter())
+                    .map(|(a, b)| (*b, *a))
+                    .collect();
+
+                for (arg, target_arg) in arginfo {
+                    let temp = self.cur.ins().fill(arg);
+                    let dest = self.cur.ins().spill(temp);
+                    let spill = self.cur.built_inst();
+                    let enc = self.cur.func.encodings[spill];
+                    let constraints = self.encinfo.operand_constraints(enc).unwrap();
+                    let rc = constraints.ins[0].regclass;
+                    let reg = regs.take(rc).unwrap();
+                    self.cur.func.locations[temp] = ValueLoc::Reg(reg);
+                    self.cur.func.locations[dest] = self.cur.func.locations[target_arg];
+                    regs.free(rc, reg)
+                }
             }
         } else if opcode.is_terminator() {
             match opcode {
                 Opcode::Return | Opcode::FallthroughReturn => {
                     // These are multi-ary and take ABI parameters.
                     // For now we can ignore return values that do not fit in registers.
-                    panic!("Return not yet implemented")
+                    //panic!("Return not yet implemented")
                 }
                 Opcode::Trap => {
                     // Nothing to do.
@@ -401,15 +485,24 @@ impl<'a> Context<'a> {
         } else if opcode.is_call() {
             // Have to set up outgoing parameters according to ABI
             panic!("Calls not yet implemented");
-        } else if opcode == Opcode::Regmove || opcode == Opcode::Regfill || opcode == Opcode::Regspill {
+        } else if opcode == Opcode::Regmove
+            || opcode == Opcode::Regfill
+            || opcode == Opcode::Regspill
+        {
             // These operations may be emitted by the register allocator or subsequent passes but
             // should not be present in the input.
             panic!("Unexpected opcodes");
         } else {
             // Vanilla instruction
-            let args = self.cur.func.dfg.inst_args(inst);
+
+            // Since we keep no live values in registers past the instruction, tied arguments are
+            // easy: we don't have to worry about killing anything.
+
             let enc = self.cur.func.encodings[inst];
             let constraints = self.encinfo.operand_constraints(enc);
+
+            // Allocate and fill inputs.
+
             if let Some(constraints) = constraints {
                 if constraints.fixed_ins {
                     panic!("Not supporting fixed_ins yet");
@@ -418,18 +511,28 @@ impl<'a> Context<'a> {
                     panic!("Not supporting tied_ops yet");
                 }
             }
-//        let replacements = vec![];
-            for arg in args {
+
+            // Allocate registers for the arguments that must be in registers.
+            //
+            // TODO: If constraints allow the argument to be left on the stack then leave it there.
+            let mut reg_args = vec![];
+            for (k, arg) in self.cur.func.dfg.inst_args(inst).iter().enumerate() {
                 if let ValueLoc::Stack(ss) = self.cur.func.locations[*arg] {
-                    //self.cur.goto_inst(inst);
-                    //let reg = <allocate some register of the correct type from a set>;
-                    //self.cur.func.locations[new_arg] = ValueLoc::Reg(reg);
-                    //let new_arg = self.cur.ins().fill(*arg);
-                    // TODO: replace the parameter in the instruction with this value
+                    let constraints = constraints.unwrap();
+                    let rc = constraints.ins[k].regclass;
+                    let reg = regs.take(rc).unwrap();
+                    reg_args.push((k, *arg, rc, reg));
                 }
             }
 
-//        dbg!(self.cur.func.dfg.inst_results(inst));
+            for (k, arg, rc, reg) in reg_args {
+                let temp = self.cur.ins().fill(arg);
+                self.cur.func.locations[temp] = ValueLoc::Reg(reg);
+                self.cur.func.dfg.inst_args_mut(inst)[k] = temp;
+                regs.free(rc, reg);
+            }
+
+            // Capture and spill outputs.
 
             if let Some(constraints) = constraints {
                 if constraints.fixed_outs {
@@ -440,48 +543,26 @@ impl<'a> Context<'a> {
                 }
             }
 
-        }
+            // Allocate a temp register for each result
+            // Update the instruction to refer to the temps
+            // Spill the temps to fresh stack slots named by the original definitions
+            // Free the registers
 
+            for (k, result) in self.cur.func.dfg.inst_results(inst).iter().enumerate() {
 /*
-        let defs = ...;
-        for def in defs {
-            let ss = self
-                .cur
-                .func
-                .stack_slots
-                .make_spill_slot(self.cur.func.dfg.value_type(def));
-            self.cur.func.locations[v] = ValueLoc::Stack(ss);
-        }
+                if let Some(constraints) = constraints {
+                    for op in constraints.outs {
+                        if op.kind != ConstraintKind::Stack {
+                            // need a register for this
+                        } else {
+                            panic!("Don't know what to do about that...");
+                        }
+                    }
+                }
 */
-    }
-
-    fn has_multiple_predecessors(&self, ebb:Ebb) -> bool {
-        let mut i = self.cfg.pred_iter(ebb);
-        i.next().is_some() && i.next().is_some()
-    }
-
-/*
-    fn insert_spill(&mut self, ebb: Ebb, stack: Value, reg: Value) {
-        self.cur.ins().with_result(stack).spill(reg);
-    }
-
-    fn spill_defn(&mut self, value:Value) {
-        let ss = self.stack_slot(value);
-        self.cur.func.locations[value] = ValueLoc::Stack(ss);
-        self.cur.ins().with_result(stack).spill(reg);
-    }
-    
-    fn stack_slot(&mut self, value:Value) -> StackSlot {
-        if Some(slot) = self.slots.get(value) {
-            slot
-        } else {
-            let ty = self.cur.func.dfg.value_type(value);
-            let slot = self.cur.func.stack_slots.make_spill_slot(ty);
-            self.slots.insert(value, slot);
-            slot
+            }
         }
     }
-*/
 }
 
 // Notes for later versions.

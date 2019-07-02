@@ -12,11 +12,11 @@ use crate::regalloc::coalescing::Coalescing;
 use crate::regalloc::coloring::Coloring;
 use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::regalloc::liveness::Liveness;
+use crate::regalloc::minimal::Minimal;
 use crate::regalloc::reload::Reload;
 use crate::regalloc::safepoint::emit_stackmaps;
 use crate::regalloc::spilling::Spilling;
 use crate::regalloc::virtregs::VirtRegs;
-use crate::regalloc::minimal::Minimal;
 use crate::result::CodegenResult;
 use crate::timing;
 use crate::topo_order::TopoOrder;
@@ -39,7 +39,7 @@ pub struct Context {
 
 pub enum Mechanism {
     Minimal,
-    Coloring
+    Coloring,
 }
 
 impl Context {
@@ -107,13 +107,10 @@ impl Context {
             }
         }
 
-        let errors =
-            match mechanism {
-                Mechanism::Minimal => 
-                    self.minimal(isa, func, cfg, domtree, errors)?,
-                Mechanism::Coloring =>
-                    self.graph_coloring(isa, func, cfg, domtree, errors)?
-            };
+        let errors = match mechanism {
+            Mechanism::Minimal => self.minimal(isa, func, cfg, domtree, errors)?,
+            Mechanism::Coloring => self.graph_coloring(isa, func, cfg, domtree, errors)?,
+        };
 
         // Even if we arrive here, (non-fatal) errors might have been reported, so we
         // must make sure absolutely nothing is wrong
@@ -132,7 +129,6 @@ impl Context {
         domtree: &mut DominatorTree,
         mut errors: VerifierErrors,
     ) -> CodegenResult<VerifierErrors> {
-
         // `Liveness` and `Coloring` are self-clearing.
         self.virtregs.clear();
 
@@ -273,7 +269,6 @@ impl Context {
         domtree: &mut DominatorTree,
         mut errors: VerifierErrors,
     ) -> CodegenResult<VerifierErrors> {
-
         self.tracker.clear();
 
         self.minimal.run(

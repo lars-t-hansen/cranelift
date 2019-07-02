@@ -32,8 +32,8 @@ use crate::timing;
 use crate::unreachable_code::eliminate_unreachable_code;
 use crate::value_label::{build_value_labels_ranges, ComparableSourceLoc, ValueLabelsRanges};
 use crate::verifier::{verify_context, verify_locations, VerifierErrors, VerifierResult};
-use std::vec::Vec;
 use std::env;
+use std::vec::Vec;
 
 /// Persistent data structures and compilation pipeline.
 pub struct Context {
@@ -313,7 +313,7 @@ impl Context {
     pub fn regalloc(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
         let mechanism = match env::var("MINIMAL_REGALLOC") {
             Ok(_) => regalloc::Mechanism::Minimal,
-            Err(_) => regalloc::Mechanism::Coloring
+            Err(_) => regalloc::Mechanism::Coloring,
         };
         self.regalloc
             .run(isa, &mut self.func, &self.cfg, &mut self.domtree, mechanism)
