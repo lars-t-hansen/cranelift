@@ -333,7 +333,7 @@ impl<'a> Context<'a> {
 
         dbg!(&self.cur.func);
         dbg!(&self.cur.func.locations);
-        process::exit(0);
+//        process::exit(0);
     }
 
     fn visit_entry_block(&mut self, entry: Ebb) {
@@ -470,13 +470,39 @@ impl<'a> Context<'a> {
                     // These are multi-ary and take ABI parameters.
                     // For now we can ignore return values that do not fit in registers.
                     //panic!("Return not yet implemented")
+
+                    // Here we have information about the desired target register, but not its
+                    // class.  We need to emit a fill into a new value and then assign the location
+                    // of the new value that register.
+
+                    let retinfo: Vec<_> = self
+                        .cur
+                        .func
+                        .dfg
+                        .inst_args(inst)
+                        .iter()
+                        .zip(&self.cur.func.signature.returns)
+                        .map(|(val, abi)| (*val, *abi))
+                        .enumerate()
+                        .collect();
+
+                    for (k, (val, abi)) in retinfo {
+                        let temp = self.cur.ins().fill(val);
+                        match abi.location {
+                            ArgumentLoc::Reg(r) => {
+                                self.cur.func.locations[temp] = ValueLoc::Reg(r);
+                                self.cur.func.dfg.inst_args_mut(inst)[k] = temp;
+                            }
+                            _ => panic!("Only register returns")
+                        }
+                    }
                 }
                 Opcode::Trap => {
                     // Nothing to do.
                 }
                 _ => {
                     // Some are handled as branches, above; some are illegal.
-                    panic!("Unexpected trigger for is_terminator");
+                    unreachable!();
                 }
             }
         } else if opcode.is_call() {
@@ -488,7 +514,10 @@ impl<'a> Context<'a> {
         {
             // These operations may be emitted by the register allocator or subsequent passes but
             // should not be present in the input.
-            panic!("Unexpected opcodes");
+            unreachable!();
+        } else if opcode == Opcode::Spill || opcode == Opcode::Fill {
+            // Ignore these, they are already allocated
+            // (I guess we could assert that they look sane)
         } else {
             // Vanilla instruction
 
@@ -510,15 +539,21 @@ impl<'a> Context<'a> {
             }
 
             // Allocate registers for the arguments that must be in registers.
-            //
-            // TODO: If constraints allow the argument to be left on the stack then leave it there.
+            // Stack args are left where they are, they should "just work".
             let mut reg_args = vec![];
             for (k, arg) in self.cur.func.dfg.inst_args(inst).iter().enumerate() {
-                if let ValueLoc::Stack(_ss) = self.cur.func.locations[*arg] {
-                    let constraints = constraints.unwrap();
-                    let rc = constraints.ins[k].regclass;
-                    let reg = regs.take(rc).unwrap();
-                    reg_args.push((k, *arg, rc, reg));
+                match self.cur.func.locations[*arg] {
+                    ValueLoc::Stack(_ss) => {
+                        let constraint = &constraints.unwrap().ins[k];
+                        if constraint.kind != ConstraintKind::Stack {
+                            let rc = constraint.regclass;
+                            let reg = regs.take(rc).unwrap();
+                            reg_args.push((k, *arg, rc, reg));
+                        }
+                    }
+                    _ => {
+                        unreachable!();
+                    }
                 }
             }
 
@@ -540,23 +575,31 @@ impl<'a> Context<'a> {
                 }
             }
 
-            // Allocate a temp register for each result
-            // Update the instruction to refer to the temps
-            // Spill the temps to fresh stack slots named by the original definitions
-            // Free the registers
-
+            let mut reg_results = vec![];
             for (k, result) in self.cur.func.dfg.inst_results(inst).iter().enumerate() {
-/*
-                if let Some(constraints) = constraints {
-                    for op in constraints.outs {
-                        if op.kind != ConstraintKind::Stack {
-                            // need a register for this
-                        } else {
-                            panic!("Don't know what to do about that...");
-                        }
-                    }
-                }
-*/
+                let constraint = &constraints.unwrap().outs[k];
+                assert!(constraint.kind != ConstraintKind::Stack);
+                let rc = constraint.regclass;
+                let reg = regs.take(rc).unwrap();
+                reg_results.push((k, *result, rc, reg));
+            }
+
+            self.cur.goto_after_inst(inst);
+            let mut last = None;
+            for (k, result, rc, reg) in reg_results {
+                let value_type = self.cur.func.dfg.value_type(result);
+                let new_result = self.cur.func.dfg.replace_result(result, value_type);
+                self.cur.ins().with_result(result).spill(new_result);
+                let spill = self.cur.built_inst();
+                self.cur.func.locations[new_result] = ValueLoc::Reg(reg);
+                let ss = self.cur.func.stack_slots.make_spill_slot(value_type);
+                self.cur.func.locations[result] = ValueLoc::Stack(ss);
+                regs.free(rc, reg);
+                last = Some(spill);
+            }
+
+            if let Some(last) = last {
+                self.cur.goto_inst(last);
             }
         }
     }
