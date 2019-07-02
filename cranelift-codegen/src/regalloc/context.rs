@@ -286,10 +286,15 @@ impl Context {
             &mut self.tracker,
         );
 
+        // Note, cannot verify liveness here because liveness information is destroyed by the
+        // register allocator.  Thus also cannot verify locations.  The regalloc could update the
+        // liveness info, but should only do so if it is needed by the verifier.
+
         if isa.flags().enable_verifier() {
             let ok = verify_context(func, cfg, domtree, isa, &mut errors).is_ok()
-                && verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok()
-                && verify_locations(isa, func, Some(&self.liveness), &mut errors).is_ok();
+                //&& verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok()
+                //&& verify_locations(isa, func, Some(&self.liveness), &mut errors).is_ok()
+                ;
             if !ok {
                 return Err(errors.into());
             }

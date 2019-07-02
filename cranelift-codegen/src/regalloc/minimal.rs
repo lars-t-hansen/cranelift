@@ -166,59 +166,60 @@
 // At non-entry ebbs, we create stack slots for the incoming args but there's nothing to do on
 // entry, everything is done in the predecessor, which copies values into the assigned arg slots.
 //
+//
+// About registers and allocation:
+//
+// The register sets are really quite complex.  Some of this complexity deals with overlapping
+// registers (which are endemic); some deals with asymmetric register sets in some CPUs (eg ARM).
+//
+// A `register unit` is an allocatable register but carries also information about whether it
+// overlaps multiple hardware registers.  The units are allocated from disjoint `register banks`,
+// which provide registers for one or more `register classes`; top-level classes are disjoint but
+// classes can be nested inside others.
+//
+// An instruction encoding's operand is allocated with constraints on the encoding, and for an
+// encoding that requires the operand to be in a register the encoding holds the desired register
+// class reference (a pointer to static data). Thus the register class is the fundamental token the
+// register allocator sees when processing the instruction.
+//
+// The register class carries several indices into the RegInfo table in the ISA.  The field `index`
+// is the index of the class itself; the field `toprc` the index of the top-level class (different
+// from `index` if the class is nested).  Possibly these can be used to index into tables that
+// mirror the RegInfo table.
+//
+// 
 
 use crate::flowgraph::ControlFlowGraph;
 use crate::cursor::{Cursor, EncCursor};
-use crate::entity::{SparseMap, SparseMapValue};
 use crate::dominator_tree::DominatorTree;
-use crate::ir::{self, ArgumentLoc, Ebb, Function, Inst, InstBuilder, Opcode, SigRef, Value, ValueLoc, StackSlot};
+use crate::ir::{self, ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode, SigRef, Value, ValueLoc, StackSlot};
 use crate::isa::registers::{RegClass, RegClassIndex, RegClassMask, RegUnit};
 use crate::isa::{ConstraintKind, EncInfo, RecipeConstraints, RegInfo, TargetIsa};
-use crate::regalloc::live_value_tracker::{LiveValue, LiveValueTracker};
+use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::regalloc::liveness::Liveness;
 use crate::regalloc::register_set::RegisterSet;
 use crate::topo_order::TopoOrder;
 use std::process;
 
-/// Map from a name in the original program to information about where it's spilled.
-type SpillMap = SparseMap<Value, SpillInfo>;
-
-/// Represents spilling information for a name.
-struct SpillInfo {
-    program_name: Value,        // Name in program
-    spilled_name: Value         // Name of spill that holds the value
-}
-
-impl SparseMapValue<Value> for SpillInfo
-{
-    fn key(&self) -> Value {
-        self.program_name
-    }
-}
-
 /// Register allocator state.
 pub struct Minimal {
-    spills: SpillMap
 }
 
 impl Minimal {
     /// Create a new register allocator state.
     pub fn new() -> Self {
-        Self {
-            spills: SpillMap::new()
-        }
+        Self { }
     }
 
     /// Clear the state of the allocator.
     pub fn clear(&mut self) {
-        self.spills.clear();
     }
 
     /// Run register allocation.
     pub fn run(&mut self,
                isa: &TargetIsa,
                func: &mut Function,
-               _cfg: &ControlFlowGraph,
+               cfg: &ControlFlowGraph,
                domtree: &mut DominatorTree,
                _liveness: &mut Liveness,
                topo: &mut TopoOrder,
@@ -231,6 +232,7 @@ impl Minimal {
             encinfo: isa.encoding_info(),
             domtree,
             topo,
+            cfg
         };
         ctx.run()
     }
@@ -251,20 +253,24 @@ struct Context<'a> {
     // References to contextual data structures we need.
     domtree: &'a DominatorTree,
     topo: &'a mut TopoOrder,
+    cfg: &'a ControlFlowGraph,
 }
 
 impl<'a> Context<'a> {
     fn run(&mut self) {
         // For the entry block, spill register parameters to the stack while retaining their names.
+
         self.visit_entry_block(self.cur.func.layout.entry_block().unwrap());
 
         // For all blocks other than the entry block, assign stack slots to all block parameters so
         // that we can later process control transfer instructions.
+
         self.visit_other_blocks();
 
         // Process all instructions in domtree order so that we'll always know the location of a
         // definition when we see its use.  Fill any register args before the instruction and spill
         // any definitions after.
+
         self.topo.reset(self.cur.func.layout.ebbs());
         while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
             self.cur.goto_top(ebb);
@@ -302,7 +308,7 @@ impl<'a> Context<'a> {
                     let ss = self.cur.func.stack_slots.make_spill_slot(abi.value_type);
                     self.cur.func.locations[param] = ValueLoc::Stack(ss);
                 }
-                ArgumentLoc::Stack(offset) => {
+                ArgumentLoc::Stack(_offset) => {
                     // Incoming stack arguments have sensible pre-initialized locations.
                     debug_assert!(if let ValueLoc::Stack(_ss) = self.cur.func.locations[param] { true } else { false });
                 }
@@ -336,24 +342,68 @@ impl<'a> Context<'a> {
             // Replace with fill/spill pair
             panic!("Copy instruction not yet implemented");
         } else if opcode.is_branch() {
-            // IndirectJumpTableBr does not take parameters
-            //
-            // For the others: Insert fill/spills where the spills target the already-assigned
-            // locations of the target ebb parameters.
-            //
-            // For fallthrough, we must know the layout successor for the block to handle the
-            // arguments correctly, so that's a little tricky?  See fallthroughs() in relaxation.js
-            panic!("Branches not yet implemented");
+            if let Some((target, side_exit)) = match self.cur.func.dfg[inst] {
+                InstructionData::IndirectJump { .. } => {
+                    debug_assert!(opcode == Opcode::IndirectJumpTableBr);
+                    None
+                }
+                InstructionData::Jump { destination, .. } => {
+                    debug_assert!(opcode == Opcode::Jump || opcode == Opcode::Fallthrough);
+                    Some((destination, false))
+                }
+                InstructionData::Branch { destination, .. } => {
+                    debug_assert!(opcode == Opcode::Brz || opcode == Opcode::Brnz);
+                    Some((destination, true))
+                }
+                InstructionData::BranchIcmp { destination, .. } => {
+                    debug_assert!(opcode == Opcode::BrIcmp);
+                    Some((destination, true))
+                }
+                InstructionData::BranchInt { destination, .. } => {
+                    debug_assert!(opcode == Opcode::Brif);
+                    Some((destination, true))
+                }
+                InstructionData::BranchFloat { destination, .. } => {
+                    debug_assert!(opcode == Opcode::Brff);
+                    Some((destination, true))
+                }
+                _ => {
+                    panic!("Unexpected trigger for is_branch");
+                }
+            } {
+                // If the jump is taken then insert fill/spills where the spills target the
+                // already-assigned locations of the target ebb parameters.  For conditional
+                // branches along critical edges this means rewriting the code: we must insert a new
+                // ebb to hold the copies and perform a jump, and the conditional branch must have
+                // its parameters removed and the target changed to the new ebb.
+                let split_critical = side_exit && self.has_multiple_predecessors(target);
+                if split_critical {
+                    panic!("Critical edge splitting not yet implemented");
+                }
+                // For fill/spill we must know how to allocate registers...
+                panic!("Branches/jumps not yet implemented");
+            }
         } else if opcode.is_terminator() {
-            // Fallthrough and IndirectJumpTableBr and Jump are handled as branches
-            // BrTable is not here, it's removed during legalization.
-            // FallthroughReturn and Return take ABI parameters
-            // Trap I'm not sure about
-            panic!("Terminators not yet implemented");
+            match opcode {
+                Opcode::Return | Opcode::FallthroughReturn => {
+                    // These are multi-ary and take ABI parameters.
+                    // For now we can ignore return values that do not fit in registers.
+                    panic!("Return not yet implemented")
+                }
+                Opcode::Trap => {
+                    // Nothing to do.
+                }
+                _ => {
+                    // Some are handled as branches, above; some are illegal.
+                    panic!("Unexpected trigger for is_terminator");
+                }
+            }
         } else if opcode.is_call() {
             // Have to set up outgoing parameters according to ABI
             panic!("Calls not yet implemented");
         } else if opcode == Opcode::Regmove || opcode == Opcode::Regfill || opcode == Opcode::Regspill {
+            // These operations may be emitted by the register allocator or subsequent passes but
+            // should not be present in the input.
             panic!("Unexpected opcodes");
         } else {
             // Vanilla instruction
@@ -403,6 +453,11 @@ impl<'a> Context<'a> {
             self.cur.func.locations[v] = ValueLoc::Stack(ss);
         }
 */
+    }
+
+    fn has_multiple_predecessors(&self, ebb:Ebb) -> bool {
+        let mut i = self.cfg.pred_iter(ebb);
+        i.next().is_some() && i.next().is_some()
     }
 
 /*
