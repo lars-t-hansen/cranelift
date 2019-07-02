@@ -337,18 +337,13 @@ impl<'a> Context<'a> {
     }
 
     fn visit_entry_block(&mut self, entry: Ebb) {
-        // TODO: Presumably there's some form of collect() that makes this easy.
-        let mut siginfo = vec![];
-        for (param, abi) in self
+        let siginfo: Vec<_> = self
             .cur
             .func
             .dfg
             .ebb_params(entry)
             .iter()
-            .zip(&self.cur.func.signature.params)
-        {
-            siginfo.push((*param, *abi));
-        }
+            .zip(&self.cur.func.signature.params).map(|(param, abi)| (*param, *abi)).collect();
 
         self.cur.goto_first_inst(entry);
         for (param, abi) in siginfo {
@@ -452,9 +447,10 @@ impl<'a> Context<'a> {
                     .iter()
                     .zip(self.cur.func.dfg.inst_args(inst).iter())
                     .map(|(a, b)| (*b, *a))
+                    .enumerate()
                     .collect();
 
-                for (arg, target_arg) in arginfo {
+                for (k, (arg, target_arg)) in arginfo {
                     let temp = self.cur.ins().fill(arg);
                     let dest = self.cur.ins().spill(temp);
                     let spill = self.cur.built_inst();
@@ -464,7 +460,8 @@ impl<'a> Context<'a> {
                     let reg = regs.take(rc).unwrap();
                     self.cur.func.locations[temp] = ValueLoc::Reg(reg);
                     self.cur.func.locations[dest] = self.cur.func.locations[target_arg];
-                    regs.free(rc, reg)
+                    self.cur.func.dfg.inst_args_mut(inst)[k] = dest;
+                    regs.free(rc, reg);
                 }
             }
         } else if opcode.is_terminator() {
@@ -517,7 +514,7 @@ impl<'a> Context<'a> {
             // TODO: If constraints allow the argument to be left on the stack then leave it there.
             let mut reg_args = vec![];
             for (k, arg) in self.cur.func.dfg.inst_args(inst).iter().enumerate() {
-                if let ValueLoc::Stack(ss) = self.cur.func.locations[*arg] {
+                if let ValueLoc::Stack(_ss) = self.cur.func.locations[*arg] {
                     let constraints = constraints.unwrap();
                     let rc = constraints.ins[k].regclass;
                     let reg = regs.take(rc).unwrap();
