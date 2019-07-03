@@ -397,7 +397,7 @@ impl<'a> Context<'a> {
 
     fn visit_inst(&mut self, inst: Inst, regs: &mut Regs) {
         let opcode = self.cur.func.dfg[inst].opcode();
-        if opcode == Opcode::Copy || opcode == Opcode::CopySpecial {
+        if opcode == Opcode::Copy {
             self.visit_copy(inst, regs, opcode);
         } else if opcode.is_branch() {
             self.visit_branch(inst, regs, opcode);
@@ -405,24 +405,20 @@ impl<'a> Context<'a> {
             self.visit_terminator(inst, regs, opcode);
         } else if opcode.is_call() {
             self.visit_call(inst, regs, opcode);
-        } else if opcode == Opcode::Regmove
-            || opcode == Opcode::Regfill
-            || opcode == Opcode::Regspill
-        {
-            // These operations may be emitted by the register allocator or subsequent passes but
-            // should not be present in the input.
-            unreachable!();
         } else if opcode == Opcode::Spill || opcode == Opcode::Fill {
-            // Ignore these, they are already allocated.
+            // Inserted by the register allocator; ignore them.
         } else {
+            // Some opcodes should not be encountered here.
+            debug_assert!(opcode != Opcode::Regmove && opcode != Opcode::Regfill && opcode != Opcode::Regspill && opcode != Opcode::CopySpecial);
             self.visit_vanilla(inst, regs, opcode);
         }
     }
 
-    fn visit_copy(&mut self, _inst: Inst, _regs: &mut Regs, _opcode: Opcode) {
-        // TODO: Implement this
-        // Replace with fill/spill pair
-        panic!("Copy instruction not yet implemented");
+    fn visit_copy(&mut self, inst: Inst, _regs: &mut Regs, _opcode: Opcode) {
+        // As the stack slots are immutable, a copy is simply a sharing of location.
+        let arg = *self.cur.func.dfg.inst_args(inst).get(0).unwrap();
+        let dest = *self.cur.func.dfg.inst_results(inst).get(0).unwrap();
+        self.cur.func.locations[dest] = self.cur.func.locations[arg];
     }
 
     fn visit_branch(&mut self, inst: Inst, regs: &mut Regs, opcode: Opcode) {
@@ -456,6 +452,7 @@ impl<'a> Context<'a> {
             }
         } {
             let new_block = side_exit && self.cur.func.dfg.ebb_params(target).len() > 0;
+            let mut target = target;
             if new_block {
                 // TODO: Implement this
                 // For conditional branches we must insert the fill/spill along the taken edge
@@ -464,7 +461,19 @@ impl<'a> Context<'a> {
                 // stack slots for the ebb parameters when the target block is entered.  The
                 // branch is rewritten to branch to this new block without parameters; the new
                 // block performs the copies and then jumps unconditionally to the target block.
-                panic!("Conditional branches with new block not yet handled.")
+                panic!("Conditional branches with new block not yet handled.");
+
+                // The current block is A
+                // The side exit is `bcc B, (arg, ...)`
+                //
+                // Create a new ebb C
+                // Make the last instruction of C `jump B(arg, ...)`
+                // Make the current instruction `bcc C`
+                // Push C onto a list of blocks to process subsequently / insert it in the layout
+                // And we're done
+                //
+                // Now C is dominated by A and so C will be processed subsequently, and the necessary
+                // copies will be inserted.
             }
 
             let arginfo: Vec<_> = self
