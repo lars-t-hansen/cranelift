@@ -333,11 +333,10 @@ impl<'a> Context<'a> {
 
         dbg!(&self.cur.func);
         dbg!(&self.cur.func.locations);
-//        process::exit(0);
     }
 
     fn visit_entry_block(&mut self, entry: Ebb) {
-        let siginfo: Vec<_> = self
+        let signature_info: Vec<_> = self
             .cur
             .func
             .dfg
@@ -346,7 +345,7 @@ impl<'a> Context<'a> {
             .zip(&self.cur.func.signature.params).map(|(param, abi)| (*param, *abi)).collect();
 
         self.cur.goto_first_inst(entry);
-        for (param, abi) in siginfo {
+        for (param, abi) in signature_info {
             match abi.location {
                 ArgumentLoc::Reg(reg) => {
                     let new_param = self.cur.func.dfg.replace_ebb_param(param, abi.value_type);
@@ -467,15 +466,7 @@ impl<'a> Context<'a> {
         } else if opcode.is_terminator() {
             match opcode {
                 Opcode::Return | Opcode::FallthroughReturn => {
-                    // These are multi-ary and take ABI parameters.
-                    // For now we can ignore return values that do not fit in registers.
-                    //panic!("Return not yet implemented")
-
-                    // Here we have information about the desired target register, but not its
-                    // class.  We need to emit a fill into a new value and then assign the location
-                    // of the new value that register.
-
-                    let retinfo: Vec<_> = self
+                    let return_info: Vec<_> = self
                         .cur
                         .func
                         .dfg
@@ -486,14 +477,16 @@ impl<'a> Context<'a> {
                         .enumerate()
                         .collect();
 
-                    for (k, (val, abi)) in retinfo {
+                    for (k, (val, abi)) in return_info {
                         let temp = self.cur.ins().fill(val);
                         match abi.location {
                             ArgumentLoc::Reg(r) => {
                                 self.cur.func.locations[temp] = ValueLoc::Reg(r);
                                 self.cur.func.dfg.inst_args_mut(inst)[k] = temp;
                             }
-                            _ => panic!("Only register returns")
+                            _ => {
+                                panic!("Only register returns")
+                            }
                         }
                     }
                 }
@@ -516,13 +509,9 @@ impl<'a> Context<'a> {
             // should not be present in the input.
             unreachable!();
         } else if opcode == Opcode::Spill || opcode == Opcode::Fill {
-            // Ignore these, they are already allocated
-            // (I guess we could assert that they look sane)
+            // Ignore these, they are already allocated.
         } else {
             // Vanilla instruction
-
-            // Since we keep no live values in registers past the instruction, tied arguments are
-            // easy: we don't have to worry about killing anything.
 
             let enc = self.cur.func.encodings[inst];
             let constraints = self.encinfo.operand_constraints(enc);
@@ -533,9 +522,6 @@ impl<'a> Context<'a> {
                 if constraints.fixed_ins {
                     panic!("Not supporting fixed_ins yet");
                 }
-                if constraints.tied_ops {
-                    panic!("Not supporting tied_ops yet");
-                }
             }
 
             // Allocate registers for the arguments that must be in registers.
@@ -545,11 +531,13 @@ impl<'a> Context<'a> {
                 match self.cur.func.locations[*arg] {
                     ValueLoc::Stack(_ss) => {
                         let constraint = &constraints.unwrap().ins[k];
-                        if constraint.kind != ConstraintKind::Stack {
-                            let rc = constraint.regclass;
-                            let reg = regs.take(rc).unwrap();
-                            reg_args.push((k, *arg, rc, reg));
+                        if constraint.kind == ConstraintKind::Stack {
+                            continue;
                         }
+                        let is_tied = if let ConstraintKind::Tied(_) = constraint.kind { true } else { false };
+                        let rc = constraint.regclass;
+                        let reg = regs.take(rc).unwrap();
+                        reg_args.push((k, *arg, rc, reg, is_tied));
                     }
                     _ => {
                         unreachable!();
@@ -557,11 +545,13 @@ impl<'a> Context<'a> {
                 }
             }
 
-            for (k, arg, rc, reg) in reg_args {
-                let temp = self.cur.ins().fill(arg);
-                self.cur.func.locations[temp] = ValueLoc::Reg(reg);
-                self.cur.func.dfg.inst_args_mut(inst)[k] = temp;
-                regs.free(rc, reg);
+            for (k, arg, rc, reg, is_tied) in &reg_args {
+                let temp = self.cur.ins().fill(*arg);
+                self.cur.func.locations[temp] = ValueLoc::Reg(*reg);
+                self.cur.func.dfg.inst_args_mut(inst)[*k] = temp;
+                if !*is_tied {
+                    regs.free(*rc, *reg);
+                }
             }
 
             // Capture and spill outputs.
@@ -570,17 +560,22 @@ impl<'a> Context<'a> {
                 if constraints.fixed_outs {
                     panic!("Not supporting fixed_outs yet");
                 }
-                if constraints.tied_ops {
-                    panic!("Not supporting tied_ops yet");
-                }
             }
 
             let mut reg_results = vec![];
             for (k, result) in self.cur.func.dfg.inst_results(inst).iter().enumerate() {
                 let constraint = &constraints.unwrap().outs[k];
-                assert!(constraint.kind != ConstraintKind::Stack);
-                let rc = constraint.regclass;
-                let reg = regs.take(rc).unwrap();
+                debug_assert!(constraint.kind != ConstraintKind::Stack);
+                let (rc, reg) =
+                    if let ConstraintKind::Tied(input) = constraint.kind {
+                        let hit = *reg_args.iter().filter(|(input_k, ..)| *input_k == input as usize).next().unwrap();
+                        debug_assert!(hit.4);
+                        (hit.2, hit.3)
+                    } else {
+                        let rc = constraint.regclass;
+                        let reg = regs.take(rc).unwrap();
+                        (rc, reg)
+                    };
                 reg_results.push((k, *result, rc, reg));
             }
 
