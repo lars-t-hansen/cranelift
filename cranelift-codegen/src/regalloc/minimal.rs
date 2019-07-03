@@ -210,16 +210,15 @@ use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::{
-    self, ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode, SigRef,
-    StackSlot, Value, ValueLoc,
+    ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode, 
+    ValueLoc,
 };
-use crate::isa::registers::{RegClass, RegClassIndex, RegClassMask, RegUnit};
-use crate::isa::{ConstraintKind, EncInfo, RecipeConstraints, RegInfo, TargetIsa};
+use crate::isa::registers::{RegClass, RegUnit};
+use crate::isa::{ConstraintKind, EncInfo, RegInfo, TargetIsa};
 use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::regalloc::liveness::Liveness;
 use crate::regalloc::register_set::RegisterSet;
 use crate::topo_order::TopoOrder;
-use std::process;
 
 /// Register allocator state.
 pub struct Minimal {}
@@ -305,6 +304,8 @@ struct Context<'a> {
 
 impl<'a> Context<'a> {
     fn run(&mut self) {
+        dbg!(&self.cur.func);
+
         // For the entry block, spill register parameters to the stack while retaining their names.
 
         self.visit_entry_block(self.cur.func.layout.entry_block().unwrap());
@@ -342,7 +343,9 @@ impl<'a> Context<'a> {
             .dfg
             .ebb_params(entry)
             .iter()
-            .zip(&self.cur.func.signature.params).map(|(param, abi)| (*param, *abi)).collect();
+            .zip(&self.cur.func.signature.params)
+            .map(|(param, abi)| (*param, *abi))
+            .collect();
 
         self.cur.goto_first_inst(entry);
         for (param, abi) in signature_info {
@@ -395,112 +398,13 @@ impl<'a> Context<'a> {
     fn visit_inst(&mut self, inst: Inst, regs: &mut Regs) {
         let opcode = self.cur.func.dfg[inst].opcode();
         if opcode == Opcode::Copy || opcode == Opcode::CopySpecial {
-            // Replace with fill/spill pair
-            panic!("Copy instruction not yet implemented");
+            self.visit_copy(inst, regs, opcode);
         } else if opcode.is_branch() {
-            if let Some((target, side_exit)) = match self.cur.func.dfg[inst] {
-                InstructionData::IndirectJump { .. } => {
-                    debug_assert!(opcode == Opcode::IndirectJumpTableBr);
-                    None
-                }
-                InstructionData::Jump { destination, .. } => {
-                    debug_assert!(opcode == Opcode::Jump || opcode == Opcode::Fallthrough);
-                    Some((destination, false))
-                }
-                InstructionData::Branch { destination, .. } => {
-                    debug_assert!(opcode == Opcode::Brz || opcode == Opcode::Brnz);
-                    Some((destination, true))
-                }
-                InstructionData::BranchIcmp { destination, .. } => {
-                    debug_assert!(opcode == Opcode::BrIcmp);
-                    Some((destination, true))
-                }
-                InstructionData::BranchInt { destination, .. } => {
-                    debug_assert!(opcode == Opcode::Brif);
-                    Some((destination, true))
-                }
-                InstructionData::BranchFloat { destination, .. } => {
-                    debug_assert!(opcode == Opcode::Brff);
-                    Some((destination, true))
-                }
-                _ => {
-                    panic!("Unexpected trigger for is_branch");
-                }
-            } {
-                let new_block = side_exit && self.cur.func.dfg.ebb_params(target).len() > 0;
-                if new_block {
-                    // For conditional branches we must insert the fill/spill along the taken edge
-                    // only.  This means we must always insert a new block to hold the new code
-                    // (even if the edge is non-critical) because the values must be in the correct
-                    // stack slots for the ebb parameters when the target block is entered.  The
-                    // branch is rewritten to branch to this new block without parameters; the new
-                    // block performs the copies and then jumps unconditionally to the target block.
-                    panic!("Conditional branches with new block not yet handled.")
-                }
-
-                let arginfo: Vec<_> = self
-                    .cur
-                    .func
-                    .dfg
-                    .ebb_params(target)
-                    .iter()
-                    .zip(self.cur.func.dfg.inst_args(inst).iter())
-                    .map(|(a, b)| (*b, *a))
-                    .enumerate()
-                    .collect();
-
-                for (k, (arg, target_arg)) in arginfo {
-                    let temp = self.cur.ins().fill(arg);
-                    let dest = self.cur.ins().spill(temp);
-                    let spill = self.cur.built_inst();
-                    let enc = self.cur.func.encodings[spill];
-                    let constraints = self.encinfo.operand_constraints(enc).unwrap();
-                    let rc = constraints.ins[0].regclass;
-                    let reg = regs.take(rc).unwrap();
-                    self.cur.func.locations[temp] = ValueLoc::Reg(reg);
-                    self.cur.func.locations[dest] = self.cur.func.locations[target_arg];
-                    self.cur.func.dfg.inst_args_mut(inst)[k] = dest;
-                    regs.free(rc, reg);
-                }
-            }
+            self.visit_branch(inst, regs, opcode);
         } else if opcode.is_terminator() {
-            match opcode {
-                Opcode::Return | Opcode::FallthroughReturn => {
-                    let return_info: Vec<_> = self
-                        .cur
-                        .func
-                        .dfg
-                        .inst_args(inst)
-                        .iter()
-                        .zip(&self.cur.func.signature.returns)
-                        .map(|(val, abi)| (*val, *abi))
-                        .enumerate()
-                        .collect();
-
-                    for (k, (val, abi)) in return_info {
-                        let temp = self.cur.ins().fill(val);
-                        match abi.location {
-                            ArgumentLoc::Reg(r) => {
-                                self.cur.func.locations[temp] = ValueLoc::Reg(r);
-                                self.cur.func.dfg.inst_args_mut(inst)[k] = temp;
-                            }
-                            _ => {
-                                panic!("Only register returns")
-                            }
-                        }
-                    }
-                }
-                Opcode::Trap => {
-                    // Nothing to do.
-                }
-                _ => {
-                    // Some are handled as branches, above; some are illegal.
-                    unreachable!();
-                }
-            }
+            self.visit_terminator(inst, regs, opcode);
         } else if opcode.is_call() {
-            // Have to set up outgoing parameters according to ABI
-            panic!("Calls not yet implemented");
+            self.visit_call(inst, regs, opcode);
         } else if opcode == Opcode::Regmove
             || opcode == Opcode::Regfill
             || opcode == Opcode::Regspill
@@ -511,92 +415,237 @@ impl<'a> Context<'a> {
         } else if opcode == Opcode::Spill || opcode == Opcode::Fill {
             // Ignore these, they are already allocated.
         } else {
-            // Vanilla instruction
+            self.visit_vanilla(inst, regs, opcode);
+        }
+    }
 
-            let enc = self.cur.func.encodings[inst];
-            let constraints = self.encinfo.operand_constraints(enc);
+    fn visit_copy(&mut self, _inst: Inst, _regs: &mut Regs, _opcode: Opcode) {
+        // TODO: Implement this
+        // Replace with fill/spill pair
+        panic!("Copy instruction not yet implemented");
+    }
 
-            // Allocate and fill inputs.
-
-            if let Some(constraints) = constraints {
-                if constraints.fixed_ins {
-                    panic!("Not supporting fixed_ins yet");
-                }
+    fn visit_branch(&mut self, inst: Inst, regs: &mut Regs, opcode: Opcode) {
+        if let Some((target, side_exit)) = match self.cur.func.dfg[inst] {
+            InstructionData::IndirectJump { .. } => {
+                debug_assert!(opcode == Opcode::IndirectJumpTableBr);
+                None
+            }
+            InstructionData::Jump { destination, .. } => {
+                debug_assert!(opcode == Opcode::Jump || opcode == Opcode::Fallthrough);
+                Some((destination, false))
+            }
+            InstructionData::Branch { destination, .. } => {
+                debug_assert!(opcode == Opcode::Brz || opcode == Opcode::Brnz);
+                Some((destination, true))
+            }
+            InstructionData::BranchIcmp { destination, .. } => {
+                debug_assert!(opcode == Opcode::BrIcmp);
+                Some((destination, true))
+            }
+            InstructionData::BranchInt { destination, .. } => {
+                debug_assert!(opcode == Opcode::Brif);
+                Some((destination, true))
+            }
+            InstructionData::BranchFloat { destination, .. } => {
+                debug_assert!(opcode == Opcode::Brff);
+                Some((destination, true))
+            }
+            _ => {
+                panic!("Unexpected trigger for is_branch");
+            }
+        } {
+            let new_block = side_exit && self.cur.func.dfg.ebb_params(target).len() > 0;
+            if new_block {
+                // TODO: Implement this
+                // For conditional branches we must insert the fill/spill along the taken edge
+                // only.  This means we must always insert a new block to hold the new code
+                // (even if the edge is non-critical) because the values must be in the correct
+                // stack slots for the ebb parameters when the target block is entered.  The
+                // branch is rewritten to branch to this new block without parameters; the new
+                // block performs the copies and then jumps unconditionally to the target block.
+                panic!("Conditional branches with new block not yet handled.")
             }
 
-            // Allocate registers for the arguments that must be in registers.
-            // Stack args are left where they are, they should "just work".
-            let mut reg_args = vec![];
-            for (k, arg) in self.cur.func.dfg.inst_args(inst).iter().enumerate() {
-                match self.cur.func.locations[*arg] {
-                    ValueLoc::Stack(_ss) => {
-                        let constraint = &constraints.unwrap().ins[k];
-                        if constraint.kind == ConstraintKind::Stack {
-                            continue;
+            let arginfo: Vec<_> = self
+                .cur
+                .func
+                .dfg
+                .ebb_params(target)
+                .iter()
+                .zip(self.cur.func.dfg.inst_args(inst).iter())
+                .map(|(a, b)| (*b, *a))
+                .enumerate()
+                .collect();
+
+            for (k, (arg, target_arg)) in arginfo {
+                let temp = self.cur.ins().fill(arg);
+                let dest = self.cur.ins().spill(temp);
+                let spill = self.cur.built_inst();
+                let enc = self.cur.func.encodings[spill];
+                let constraints = self.encinfo.operand_constraints(enc).unwrap();
+                let rc = constraints.ins[0].regclass;
+                let reg = regs.take(rc).unwrap();
+                self.cur.func.locations[temp] = ValueLoc::Reg(reg);
+                self.cur.func.locations[dest] = self.cur.func.locations[target_arg];
+                self.cur.func.dfg.inst_args_mut(inst)[k] = dest;
+                regs.free(rc, reg);
+            }
+        }
+    }
+
+    fn visit_terminator(&mut self, inst: Inst, _regs: &mut Regs, opcode: Opcode) {
+        // Some terminators are handled as branches and should not be seen here; others are illegal.
+        match opcode {
+            Opcode::Return | Opcode::FallthroughReturn => {
+                let return_info: Vec<_> = self
+                    .cur
+                    .func
+                    .dfg
+                    .inst_args(inst)
+                    .iter()
+                    .zip(&self.cur.func.signature.returns)
+                    .map(|(val, abi)| (*val, *abi))
+                    .enumerate()
+                    .collect();
+
+                for (k, (val, abi)) in return_info {
+                    let temp = self.cur.ins().fill(val);
+                    match abi.location {
+                        ArgumentLoc::Reg(r) => {
+                            self.cur.func.locations[temp] = ValueLoc::Reg(r);
+                            self.cur.func.dfg.inst_args_mut(inst)[k] = temp;
                         }
-                        let is_tied = if let ConstraintKind::Tied(_) = constraint.kind { true } else { false };
-                        let rc = constraint.regclass;
-                        let reg = regs.take(rc).unwrap();
-                        reg_args.push((k, *arg, rc, reg, is_tied));
-                    }
-                    _ => {
-                        unreachable!();
+                        _ => panic!("Only register returns"),
                     }
                 }
             }
+            Opcode::Trap => {}
+            _ => unreachable!(),
+        }
+    }
 
-            for (k, arg, rc, reg, is_tied) in &reg_args {
+    fn visit_call(&mut self, _inst: Inst, _regs: &mut Regs, _opcode: Opcode) {
+        // TODO: Implement this
+        // Have to set up outgoing parameters according to ABI
+        panic!("Calls not yet implemented");
+    }
+
+    fn visit_vanilla(&mut self, inst: Inst, regs: &mut Regs, _opcode: Opcode) {
+        let constraints = self.encinfo.operand_constraints(self.cur.func.encodings[inst]);
+
+        // Reserve any fixed input registers.
+        if let Some(constraints) = constraints {
+            if constraints.fixed_ins {
+                for constraint in constraints.ins {
+                    match constraint.kind {
+                        ConstraintKind::FixedReg(r) => regs.take_specific(constraint.regclass, r),
+                        ConstraintKind::FixedTied(r) => regs.take_specific(constraint.regclass, r),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Assign all input registers.
+        let mut reg_args = vec![];
+        for (k, arg) in self.cur.func.dfg.inst_args(inst).iter().enumerate() {
+            debug_assert!(
+                if let ValueLoc::Stack(_ss) = self.cur.func.locations[*arg] {
+                    true
+                } else {
+                    self.cur.func.dfg.value_type(*arg).is_flags()
+                }
+            );
+            let constraint = &constraints.unwrap().ins[k];
+            if constraint.kind == ConstraintKind::Stack {
+                continue;
+            }
+            let rc = constraint.regclass;
+            let (reg, is_tied) = match constraint.kind {
+                ConstraintKind::FixedReg(r) => (r, false),
+                ConstraintKind::FixedTied(r) => (r, true),
+                ConstraintKind::Tied(_) => (regs.take(rc).unwrap(), true),
+                ConstraintKind::Reg => (regs.take(rc).unwrap(), false),
+                ConstraintKind::Stack => unreachable!(),
+            };
+            reg_args.push((k, *arg, rc, reg, is_tied));
+        }
+
+        // Insert fills, assign locations, update the instruction, free registers.
+        for (k, arg, rc, reg, is_tied) in &reg_args {
+            let value_type = self.cur.func.dfg.value_type(*arg);
+            if value_type.is_flags() {
+                self.cur.func.locations[*arg] = ValueLoc::Reg(*reg);
+            } else {
                 let temp = self.cur.ins().fill(*arg);
                 self.cur.func.locations[temp] = ValueLoc::Reg(*reg);
                 self.cur.func.dfg.inst_args_mut(inst)[*k] = temp;
-                if !*is_tied {
-                    regs.free(*rc, *reg);
-                }
             }
-
-            // Capture and spill outputs.
-
-            if let Some(constraints) = constraints {
-                if constraints.fixed_outs {
-                    panic!("Not supporting fixed_outs yet");
-                }
-            }
-
-            let mut reg_results = vec![];
-            for (k, result) in self.cur.func.dfg.inst_results(inst).iter().enumerate() {
-                let constraint = &constraints.unwrap().outs[k];
-                debug_assert!(constraint.kind != ConstraintKind::Stack);
-                let (rc, reg) =
-                    if let ConstraintKind::Tied(input) = constraint.kind {
-                        let hit = *reg_args.iter().filter(|(input_k, ..)| *input_k == input as usize).next().unwrap();
-                        debug_assert!(hit.4);
-                        (hit.2, hit.3)
-                    } else {
-                        let rc = constraint.regclass;
-                        let reg = regs.take(rc).unwrap();
-                        (rc, reg)
-                    };
-                reg_results.push((k, *result, rc, reg));
-            }
-
-            self.cur.goto_after_inst(inst);
-            let mut last = None;
-            for (k, result, rc, reg) in reg_results {
-                let value_type = self.cur.func.dfg.value_type(result);
-                let new_result = self.cur.func.dfg.replace_result(result, value_type);
-                self.cur.ins().with_result(result).spill(new_result);
-                let spill = self.cur.built_inst();
-                self.cur.func.locations[new_result] = ValueLoc::Reg(reg);
-                let ss = self.cur.func.stack_slots.make_spill_slot(value_type);
-                self.cur.func.locations[result] = ValueLoc::Stack(ss);
-                regs.free(rc, reg);
-                last = Some(spill);
-            }
-
-            if let Some(last) = last {
-                self.cur.goto_inst(last);
+            if !*is_tied {
+                regs.free(*rc, *reg);
             }
         }
+
+        // Reserve any fixed output registers that are not also tied.
+        if let Some(constraints) = constraints {
+            if constraints.fixed_outs {
+                for constraint in constraints.outs {
+                    match constraint.kind {
+                        ConstraintKind::FixedReg(r) => regs.take_specific(constraint.regclass, r),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Assign the output registers.
+        let mut reg_results = vec![];
+        for (k, result) in self.cur.func.dfg.inst_results(inst).iter().enumerate() {
+            let constraint = &constraints.unwrap().outs[k];
+            debug_assert!(constraint.kind != ConstraintKind::Stack);
+            let (rc, reg) = match constraint.kind {
+                ConstraintKind::FixedTied(r) => (constraint.regclass, r),
+                ConstraintKind::FixedReg(r) => (constraint.regclass, r),
+                ConstraintKind::Tied(input) => {
+                    let hit = *reg_args
+                        .iter()
+                        .filter(|(input_k, ..)| *input_k == input as usize)
+                        .next()
+                        .unwrap();
+                    debug_assert!(hit.4);
+                    (hit.2, hit.3)
+                }
+                ConstraintKind::Reg => {
+                    (constraint.regclass, regs.take(constraint.regclass).unwrap())
+                }
+                ConstraintKind::Stack => unreachable!(),
+            };
+            reg_results.push((k, *result, rc, reg));
+        }
+
+        // Insert spills, assign locations, update the instruction, free registers.
+        let mut last = inst;
+        self.cur.goto_after_inst(inst);
+        for (_k, result, rc, reg) in reg_results {
+            let value_type = self.cur.func.dfg.value_type(result);
+            if value_type.is_flags() {
+                self.cur.func.locations[result] = ValueLoc::Reg(reg);
+            } else {
+                let new_result = self.cur.func.dfg.replace_result(result, value_type);
+                self.cur.func.locations[new_result] = ValueLoc::Reg(reg);
+
+                self.cur.ins().with_result(result).spill(new_result);
+                let spill = self.cur.built_inst();
+                let ss = self.cur.func.stack_slots.make_spill_slot(value_type);
+                self.cur.func.locations[result] = ValueLoc::Stack(ss);
+
+                last = spill;
+            }
+
+            regs.free(rc, reg);
+        }
+        self.cur.goto_inst(last);
     }
 }
 
