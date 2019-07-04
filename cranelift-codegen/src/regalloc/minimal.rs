@@ -211,7 +211,7 @@ use crate::dominator_tree::DominatorTree;
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::{
     ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode, 
-    ValueLoc,
+    Value, ValueLoc,
 };
 use crate::isa::registers::{RegClass, RegUnit};
 use crate::isa::{ConstraintKind, EncInfo, RegInfo, TargetIsa};
@@ -237,7 +237,7 @@ impl Minimal {
         &mut self,
         isa: &TargetIsa,
         func: &mut Function,
-        cfg: &ControlFlowGraph,
+        cfg: &mut ControlFlowGraph,
         domtree: &mut DominatorTree,
         _liveness: &mut Liveness,
         topo: &mut TopoOrder,
@@ -297,9 +297,9 @@ struct Context<'a> {
     encinfo: EncInfo,
 
     // References to contextual data structures we need.
-    domtree: &'a DominatorTree,
+    domtree: &'a mut DominatorTree,
     topo: &'a mut TopoOrder,
-    cfg: &'a ControlFlowGraph,
+    cfg: &'a mut ControlFlowGraph,
 }
 
 impl<'a> Context<'a> {
@@ -331,6 +331,22 @@ impl<'a> Context<'a> {
                 }
             }
         }
+
+        // TODO: Only do this if we inserted any blocks, though in fairness, we will almost always
+        // do that.  This might be a bit expensive.  We can probably make it cheaper since we're
+        // *almost* splitting blocks, and in that case at least the domtree computation can be
+        // simplified.
+        //
+        // Another take on this is that the splitting of conditional branches that pass parameters
+        // is a mechanical transformation that can happen at any time, in particular, it can happen
+        // before the domtree is computed by the compiler.  In that case it requires an additional
+        // pass over the flow graph looking for branches that pass parameters, but it'll simplify
+        // the minimal allocator, so it may be worth factoring out.
+        //
+        // Incidentally this is the same code as the flowgraph() function in ../context.rs, used by
+        // testing code.
+        self.cfg.compute(&self.cur.func);
+        self.domtree.compute(&self.cur.func, self.cfg);
 
         dbg!(&self.cur.func);
         dbg!(&self.cur.func.locations);
@@ -421,6 +437,9 @@ impl<'a> Context<'a> {
         self.cur.func.locations[dest] = self.cur.func.locations[arg];
     }
 
+    // FIXME: Must *also* update the condition argument for the branch instruction / dispatch value
+    // for table branch.
+
     fn visit_branch(&mut self, inst: Inst, regs: &mut Regs, opcode: Opcode) {
         if let Some((target, side_exit)) = match self.cur.func.dfg[inst] {
             InstructionData::IndirectJump { .. } => {
@@ -451,29 +470,48 @@ impl<'a> Context<'a> {
                 panic!("Unexpected trigger for is_branch");
             }
         } {
-            let new_block = side_exit && self.cur.func.dfg.ebb_params(target).len() > 0;
-            let mut target = target;
-            if new_block {
-                // TODO: Implement this
-                // For conditional branches we must insert the fill/spill along the taken edge
-                // only.  This means we must always insert a new block to hold the new code
-                // (even if the edge is non-critical) because the values must be in the correct
-                // stack slots for the ebb parameters when the target block is entered.  The
-                // branch is rewritten to branch to this new block without parameters; the new
-                // block performs the copies and then jumps unconditionally to the target block.
-                panic!("Conditional branches with new block not yet handled.");
+            // Insert the fill/spill along the taken edge only!  May have to create a new block to
+            // hold the fill/spill instructions.
 
-                // The current block is A
-                // The side exit is `bcc B, (arg, ...)`
-                //
-                // Create a new ebb C
-                // Make the last instruction of C `jump B(arg, ...)`
-                // Make the current instruction `bcc C`
-                // Push C onto a list of blocks to process subsequently / insert it in the layout
-                // And we're done
-                //
-                // Now C is dominated by A and so C will be processed subsequently, and the necessary
-                // copies will be inserted.
+            let mut inst = inst;
+            let orig_inst = inst;
+
+            let new_block = side_exit && self.cur.func.dfg.ebb_params(target).len() > 0;
+            if new_block {
+                // Remember the arguments to the side exit.
+                let jump_args: Vec<Value> = self.cur.func.dfg.inst_variable_args(inst).iter().map(|x| *x).collect();
+
+                // Create the block the side exit will jump to.
+                let new_ebb = self.cur.func.dfg.make_ebb();
+                self.cur.layout_mut().append_ebb(new_ebb);
+                // Must 
+
+                // Remove the arguments from the side exit and make it jump to the new block.
+                match opcode {
+                    Opcode::Brz => {
+                        let val = *self.cur.func.dfg.inst_args(inst).get(0).unwrap();
+                        self.cur.func.dfg.replace(inst).brz(val, new_ebb, &[]);
+                    }
+                    Opcode::Brnz => {
+                        let val = *self.cur.func.dfg.inst_args(inst).get(0).unwrap();
+                        self.cur.func.dfg.replace(inst).brnz(val, new_ebb, &[]);
+                    }
+                    _ => {
+                        panic!("Unhandled branch type"); // TODO: more
+                    }
+                }
+                let ok = self.cur.func.update_encoding(inst, self.cur.isa).is_ok();
+                debug_assert!(ok);
+
+                // Insert a jump to the original target with the original arguments into the new
+                // block.
+                self.cur.goto_first_insertion_point(new_ebb);
+                self.cur.ins().jump(target, jump_args.as_slice());
+
+                // Make the fill/spill code target the jump instruction in the new block, otherwise
+                // it won't be visited, as it is not in the current topo order.
+                self.cur.goto_first_inst(new_ebb);
+                inst = self.cur.current_inst().unwrap();
             }
 
             let arginfo: Vec<_> = self
@@ -487,6 +525,9 @@ impl<'a> Context<'a> {
                 .enumerate()
                 .collect();
 
+            if new_block {
+                dbg!(&arginfo);
+            }
             for (k, (arg, target_arg)) in arginfo {
                 let temp = self.cur.ins().fill(arg);
                 let dest = self.cur.ins().spill(temp);
@@ -499,6 +540,11 @@ impl<'a> Context<'a> {
                 self.cur.func.locations[dest] = self.cur.func.locations[target_arg];
                 self.cur.func.dfg.inst_args_mut(inst)[k] = dest;
                 regs.free(rc, reg);
+            }
+
+            // Restore the point, so that the iteration will work correctly.
+            if new_block {
+                self.cur.goto_inst(orig_inst);
             }
         }
     }

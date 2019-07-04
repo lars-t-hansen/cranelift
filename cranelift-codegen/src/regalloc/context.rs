@@ -87,7 +87,7 @@ impl Context {
         &mut self,
         isa: &dyn TargetIsa,
         func: &mut Function,
-        cfg: &ControlFlowGraph,
+        cfg: &mut ControlFlowGraph,
         domtree: &mut DominatorTree,
         mechanism: Mechanism,
     ) -> CodegenResult<()> {
@@ -101,7 +101,6 @@ impl Context {
 
         if isa.flags().enable_verifier() {
             let ok = verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok();
-
             if !ok {
                 return Err(errors.into());
             }
@@ -125,7 +124,7 @@ impl Context {
         &mut self,
         isa: &TargetIsa,
         func: &mut Function,
-        cfg: &ControlFlowGraph,
+        cfg: &mut ControlFlowGraph,
         domtree: &mut DominatorTree,
         mut errors: VerifierErrors,
     ) -> CodegenResult<VerifierErrors> {
@@ -265,7 +264,7 @@ impl Context {
         &mut self,
         isa: &TargetIsa,
         func: &mut Function,
-        cfg: &ControlFlowGraph,
+        cfg: &mut ControlFlowGraph,
         domtree: &mut DominatorTree,
         mut errors: VerifierErrors,
     ) -> CodegenResult<VerifierErrors> {

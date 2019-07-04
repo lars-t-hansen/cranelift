@@ -316,7 +316,7 @@ impl Context {
             Err(_) => regalloc::Mechanism::Coloring,
         };
         self.regalloc
-            .run(isa, &mut self.func, &self.cfg, &mut self.domtree, mechanism)
+            .run(isa, &mut self.func, &mut self.cfg, &mut self.domtree, mechanism)
     }
 
     /// Insert prologue and epilogues after computing the stack frame layout.
