@@ -12,14 +12,16 @@
 //! obey all instruction constraints (eg fixed registers and register classes), but is otherwise the
 //! simplest register allocator imaginable for our given IR structure.
 
+// TODO: can we factor more code?
+
 use std::vec::Vec;
 
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::{
-    ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode, 
-    Value, ValueLoc,
+    AbiParam, ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode, 
+    StackSlotKind, Value, ValueLoc,
 };
 use crate::isa::registers::{RegClass, RegUnit};
 use crate::isa::{ConstraintKind, EncInfo, TargetIsa};
@@ -208,14 +210,6 @@ impl<'a> Context<'a> {
 
     fn visit_inst(&mut self, inst: Inst, regs: &mut Regs) {
         let opcode = self.cur.func.dfg[inst].opcode();
-
-        // TODO: Fallthrough will make our ebb-insertion mechanism in visit_branch() not work.  We
-        // really should not have plain Fallthrough in the code at this point, though I don't think
-        // anything stops them from being there.  The "right" fix is to pick a block B that the new
-        // block is to be inserted after, and if B ends with a fallthrough rewrite it as a jump.
-        // This is not hard.
-        debug_assert!(opcode != Opcode::Fallthrough);
-
         if opcode == Opcode::Copy {
             self.visit_copy(inst, regs, opcode);
         } else if opcode.is_branch() {
@@ -224,6 +218,8 @@ impl<'a> Context<'a> {
             self.visit_terminator(inst, regs, opcode);
         } else if opcode.is_call() {
             self.visit_call(inst, regs, opcode);
+        } else if opcode == Opcode::Spill && self.is_spill_to_outgoing_arg(inst) {
+            self.visit_outgoing_arg_spill(inst, regs, opcode);
         } else if opcode == Opcode::Spill || opcode == Opcode::Fill {
             // Inserted by the register allocator; ignore them.
         } else {
@@ -314,37 +310,79 @@ impl<'a> Context<'a> {
         // Some terminators are handled as branches and should not be seen here; others are illegal.
         match opcode {
             Opcode::Return | Opcode::FallthroughReturn => {
-                let return_info: Vec<_> = self
-                    .cur
-                    .func
-                    .dfg
-                    .inst_args(inst)
-                    .iter()
-                    .zip(&self.cur.func.signature.returns)
-                    .map(|(val, abi)| (*val, *abi))
-                    .enumerate()
-                    .collect();
-
-                for (k, (val, abi)) in return_info {
-                    let temp = self.cur.ins().fill(val);
-                    match abi.location {
-                        ArgumentLoc::Reg(r) => {
-                            self.cur.func.locations[temp] = ValueLoc::Reg(r);
-                            self.cur.func.dfg.inst_args_mut(inst)[k] = temp;
-                        }
-                        _ => panic!("Only register returns"),
-                    }
-                }
+                let abi_info = self.make_abi_info(self.cur.func.dfg.inst_args(inst), &self.cur.func.signature.returns);
+                let to_stack = self.load_abi_registers(inst, &abi_info);
+                debug_assert!(!to_stack);
             }
             Opcode::Trap => {}
             _ => unreachable!(),
         }
     }
 
-    fn visit_call(&mut self, _inst: Inst, _regs: &mut Regs, _opcode: Opcode) {
-        // TODO: Implement this
-        // Have to set up outgoing parameters according to ABI
-        panic!("Calls not yet implemented");
+    fn make_abi_info(&self, vals:&[Value], abi: &[AbiParam]) -> Vec<(usize, (Value, AbiParam))> {
+        vals.iter().zip(abi).map(|(val, abi)| (*val, *abi)).enumerate().collect()
+    }
+
+    fn load_abi_registers(&mut self, inst: Inst, abi_info: &[(usize, (Value, AbiParam))]) -> bool {
+        let mut to_stack = false;
+        for (k, (val, abi)) in abi_info {
+            match abi.location {
+                ArgumentLoc::Reg(r) => {
+                    let temp = self.cur.ins().fill(*val);
+                    self.cur.func.locations[temp] = ValueLoc::Reg(r);
+                    self.cur.func.dfg.inst_args_mut(inst)[*k] = temp;
+                }
+                _ => {
+                    to_stack = true;
+                }
+            }
+        }
+        to_stack
+    }
+
+    fn store_abi_registers(&mut self, inst: Inst, abi_info: &[(usize, (Value, AbiParam))]) -> (bool, Inst) {
+        let mut from_stack = false;
+        let mut last = inst;
+        for (_, (result, abi)) in abi_info {
+            match abi.location {
+                ArgumentLoc::Reg(reg) => {
+                    last = self.spill_from_register(*result, reg);
+                    self.cur.goto_after_inst(last);
+                }
+                _ => {
+                    from_stack = true;
+                }
+            }
+        }
+        (from_stack, last)
+    }
+
+    fn visit_outgoing_arg_spill(&mut self, inst: Inst, regs: &mut Regs, _opcode: Opcode) {
+        let arg = self.cur.func.dfg.inst_args(inst)[0];
+        let temp = self.cur.ins().fill(arg);
+        self.cur.func.dfg.inst_args_mut(inst)[0] = temp;
+        let enc = self.cur.func.encodings[inst];
+        let constraints = self.encinfo.operand_constraints(enc).unwrap();
+        let rc = constraints.ins[0].regclass;
+        let reg = regs.take(rc).unwrap();
+        self.cur.func.locations[temp] = ValueLoc::Reg(reg);
+        regs.free(rc, reg);
+    }
+
+    fn visit_call(&mut self, inst: Inst, _regs: &mut Regs, _opcode: Opcode) {
+        // Setup register arguments
+        let arg_info = self.make_abi_info(self.cur.func.dfg.inst_args(inst), &self.cur.func.signature.params);
+        self.load_abi_registers(inst, &arg_info);
+
+        // Move past the instruction
+        self.cur.goto_after_inst(inst);
+
+        // Capture results
+        let result_info = self.make_abi_info(self.cur.func.dfg.inst_results(inst), &self.cur.func.signature.returns);
+        let (from_stack, last) = self.store_abi_registers(inst, &result_info);
+        debug_assert!(!from_stack);
+
+        self.cur.goto_inst(last);
     }
 
     fn visit_plain_inst(&mut self, inst: Inst, regs: &mut Regs, _opcode: Opcode) {
@@ -448,20 +486,35 @@ impl<'a> Context<'a> {
             if value_type.is_flags() {
                 self.cur.func.locations[result] = ValueLoc::Reg(reg);
             } else {
-                let new_result = self.cur.func.dfg.replace_result(result, value_type);
-                self.cur.func.locations[new_result] = ValueLoc::Reg(reg);
-
-                self.cur.ins().with_result(result).spill(new_result);
-                let spill = self.cur.built_inst();
-                let ss = self.cur.func.stack_slots.make_spill_slot(value_type);
-                self.cur.func.locations[result] = ValueLoc::Stack(ss);
-
-                last = spill;
+                last = self.spill_from_register(result, reg);
+                self.cur.goto_after_inst(last);
             }
 
             regs.free(rc, reg);
         }
         self.cur.goto_inst(last);
+    }
+
+    fn spill_from_register(&mut self, result: Value, reg:RegUnit) -> Inst {
+        let value_type = self.cur.func.dfg.value_type(result);
+        let new_result = self.cur.func.dfg.replace_result(result, value_type);
+        self.cur.func.locations[new_result] = ValueLoc::Reg(reg);
+
+        self.cur.ins().with_result(result).spill(new_result);
+        let spill = self.cur.built_inst();
+        let ss = self.cur.func.stack_slots.make_spill_slot(value_type);
+        self.cur.func.locations[result] = ValueLoc::Stack(ss);
+
+        spill
+    }
+
+    fn is_spill_to_outgoing_arg(&self, inst:Inst) -> bool {
+        debug_assert!(self.cur.func.dfg[inst].opcode() == Opcode::Spill);
+        let result = self.cur.func.dfg.inst_results(inst)[0];
+        if let ValueLoc::Stack(ss) = self.cur.func.locations[result] {
+            return self.cur.func.stack_slots[ss].kind == StackSlotKind::OutgoingArg;
+        }
+        false
     }
 
     // Returns (Option<(target_ebb, side_exit)>, has_argument)
@@ -472,7 +525,8 @@ impl<'a> Context<'a> {
                 (None, true) 
             }
             InstructionData::Jump { destination, .. } => {
-                debug_assert!(opcode == Opcode::Jump || opcode == Opcode::Fallthrough);
+                // There should be no Opcode::Fallthrough nodes at this stage.
+                debug_assert!(opcode == Opcode::Jump);
                 (Some((destination, false)), false)
             }
             InstructionData::Branch { destination, .. } => {
@@ -536,9 +590,8 @@ impl<'a> Context<'a> {
         debug_assert!(ok);
     }
 
-    // For now, a new ebb must be inserted before the last ebb because the last ebb may have a
-    // fallthrough_return and can't have anything after it.  TODO: This trick only works if there
-    // are no Fallthrough instructions in the block graph.
+    // A new ebb must be inserted before the last ebb because the last ebb may have a
+    // fallthrough_return and can't have anything after it.
     fn make_empty_ebb(&mut self) -> Ebb {
         let new_ebb = self.cur.func.dfg.make_ebb();
         let last_ebb = self.cur.layout().last_ebb().unwrap();
