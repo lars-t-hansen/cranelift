@@ -13,6 +13,7 @@
 //! simplest register allocator imaginable for our given IR structure.
 
 // TODO: can we factor more code?
+// TODO: can the flags hack be generalized?
 
 use std::vec::Vec;
 
@@ -20,13 +21,11 @@ use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::{
-    AbiParam, ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode, 
+    AbiParam, ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode,
     StackSlotKind, Value, ValueLoc,
 };
 use crate::isa::registers::{RegClass, RegUnit};
 use crate::isa::{ConstraintKind, EncInfo, TargetIsa};
-use crate::regalloc::live_value_tracker::LiveValueTracker;
-use crate::regalloc::liveness::Liveness;
 use crate::regalloc::register_set::RegisterSet;
 use crate::topo_order::TopoOrder;
 
@@ -49,9 +48,7 @@ impl Minimal {
         func: &mut Function,
         cfg: &mut ControlFlowGraph,
         domtree: &mut DominatorTree,
-        _liveness: &mut Liveness,
         topo: &mut TopoOrder,
-        _tracker: &mut LiveValueTracker,
     ) {
         let mut ctx = Context {
             new_blocks: false,
@@ -97,7 +94,7 @@ impl Regs {
 struct Context<'a> {
     // True if new blocks were inserted
     new_blocks: bool,
-        
+
     // Set of registers that the allocator can use.
     usable_regs: RegisterSet,
 
@@ -224,7 +221,12 @@ impl<'a> Context<'a> {
             // Inserted by the register allocator; ignore them.
         } else {
             // Some opcodes should not be encountered here.
-            debug_assert!(opcode != Opcode::Regmove && opcode != Opcode::Regfill && opcode != Opcode::Regspill && opcode != Opcode::CopySpecial);
+            debug_assert!(
+                opcode != Opcode::Regmove
+                    && opcode != Opcode::Regfill
+                    && opcode != Opcode::Regspill
+                    && opcode != Opcode::CopySpecial
+            );
             self.visit_plain_inst(inst, regs, opcode);
         }
     }
@@ -248,7 +250,14 @@ impl<'a> Context<'a> {
             let new_block = side_exit && self.cur.func.dfg.ebb_params(target).len() > 0;
             if new_block {
                 // Remember the arguments to the side exit.
-                let jump_args: Vec<Value> = self.cur.func.dfg.inst_variable_args(inst).iter().map(|x| *x).collect();
+                let jump_args: Vec<Value> = self
+                    .cur
+                    .func
+                    .dfg
+                    .inst_variable_args(inst)
+                    .iter()
+                    .map(|x| *x)
+                    .collect();
 
                 // Create the block the side exit will jump to.
                 let new_ebb = self.make_empty_ebb();
@@ -310,7 +319,10 @@ impl<'a> Context<'a> {
         // Some terminators are handled as branches and should not be seen here; others are illegal.
         match opcode {
             Opcode::Return | Opcode::FallthroughReturn => {
-                let abi_info = self.make_abi_info(self.cur.func.dfg.inst_args(inst), &self.cur.func.signature.returns);
+                let abi_info = self.make_abi_info(
+                    self.cur.func.dfg.inst_args(inst),
+                    &self.cur.func.signature.returns,
+                );
                 let to_stack = self.load_abi_registers(inst, &abi_info);
                 debug_assert!(!to_stack);
             }
@@ -319,8 +331,12 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn make_abi_info(&self, vals:&[Value], abi: &[AbiParam]) -> Vec<(usize, (Value, AbiParam))> {
-        vals.iter().zip(abi).map(|(val, abi)| (*val, *abi)).enumerate().collect()
+    fn make_abi_info(&self, vals: &[Value], abi: &[AbiParam]) -> Vec<(usize, (Value, AbiParam))> {
+        vals.iter()
+            .zip(abi)
+            .map(|(val, abi)| (*val, *abi))
+            .enumerate()
+            .collect()
     }
 
     fn load_abi_registers(&mut self, inst: Inst, abi_info: &[(usize, (Value, AbiParam))]) -> bool {
@@ -340,7 +356,11 @@ impl<'a> Context<'a> {
         to_stack
     }
 
-    fn store_abi_registers(&mut self, inst: Inst, abi_info: &[(usize, (Value, AbiParam))]) -> (bool, Inst) {
+    fn store_abi_registers(
+        &mut self,
+        inst: Inst,
+        abi_info: &[(usize, (Value, AbiParam))],
+    ) -> (bool, Inst) {
         let mut from_stack = false;
         let mut last = inst;
         for (_, (result, abi)) in abi_info {
@@ -371,14 +391,20 @@ impl<'a> Context<'a> {
 
     fn visit_call(&mut self, inst: Inst, _regs: &mut Regs, _opcode: Opcode) {
         // Setup register arguments
-        let arg_info = self.make_abi_info(self.cur.func.dfg.inst_args(inst), &self.cur.func.signature.params);
+        let arg_info = self.make_abi_info(
+            self.cur.func.dfg.inst_args(inst),
+            &self.cur.func.signature.params,
+        );
         self.load_abi_registers(inst, &arg_info);
 
         // Move past the instruction
         self.cur.goto_after_inst(inst);
 
         // Capture results
-        let result_info = self.make_abi_info(self.cur.func.dfg.inst_results(inst), &self.cur.func.signature.returns);
+        let result_info = self.make_abi_info(
+            self.cur.func.dfg.inst_results(inst),
+            &self.cur.func.signature.returns,
+        );
         let (from_stack, last) = self.store_abi_registers(inst, &result_info);
         debug_assert!(!from_stack);
 
@@ -386,7 +412,9 @@ impl<'a> Context<'a> {
     }
 
     fn visit_plain_inst(&mut self, inst: Inst, regs: &mut Regs, _opcode: Opcode) {
-        let constraints = self.encinfo.operand_constraints(self.cur.func.encodings[inst]);
+        let constraints = self
+            .encinfo
+            .operand_constraints(self.cur.func.encodings[inst]);
 
         // Reserve any fixed input registers.
         if let Some(constraints) = constraints {
@@ -495,7 +523,7 @@ impl<'a> Context<'a> {
         self.cur.goto_inst(last);
     }
 
-    fn spill_from_register(&mut self, result: Value, reg:RegUnit) -> Inst {
+    fn spill_from_register(&mut self, result: Value, reg: RegUnit) -> Inst {
         let value_type = self.cur.func.dfg.value_type(result);
         let new_result = self.cur.func.dfg.replace_result(result, value_type);
         self.cur.func.locations[new_result] = ValueLoc::Reg(reg);
@@ -508,7 +536,7 @@ impl<'a> Context<'a> {
         spill
     }
 
-    fn is_spill_to_outgoing_arg(&self, inst:Inst) -> bool {
+    fn is_spill_to_outgoing_arg(&self, inst: Inst) -> bool {
         debug_assert!(self.cur.func.dfg[inst].opcode() == Opcode::Spill);
         let result = self.cur.func.dfg.inst_results(inst)[0];
         if let ValueLoc::Stack(ss) = self.cur.func.locations[result] {
@@ -518,11 +546,11 @@ impl<'a> Context<'a> {
     }
 
     // Returns (Option<(target_ebb, side_exit)>, has_argument)
-    fn classify_branch(&self, inst:Inst, opcode:Opcode) -> (Option<(Ebb, bool)>, bool) {
+    fn classify_branch(&self, inst: Inst, opcode: Opcode) -> (Option<(Ebb, bool)>, bool) {
         match self.cur.func.dfg[inst] {
             InstructionData::IndirectJump { .. } => {
                 debug_assert!(opcode == Opcode::IndirectJumpTableBr);
-                (None, true) 
+                (None, true)
             }
             InstructionData::Jump { destination, .. } => {
                 // There should be no Opcode::Fallthrough nodes at this stage.
@@ -567,19 +595,31 @@ impl<'a> Context<'a> {
                 if let InstructionData::BranchIcmp { cond, .. } = self.cur.func.dfg[inst] {
                     let x = *self.cur.func.dfg.inst_args(inst).get(0).unwrap();
                     let y = *self.cur.func.dfg.inst_args(inst).get(1).unwrap();
-                    self.cur.func.dfg.replace(inst).br_icmp(cond, x, y, new_ebb, &[]);
+                    self.cur
+                        .func
+                        .dfg
+                        .replace(inst)
+                        .br_icmp(cond, x, y, new_ebb, &[]);
                 }
             }
             Opcode::Brif => {
                 if let InstructionData::BranchInt { cond, .. } = self.cur.func.dfg[inst] {
                     let val = *self.cur.func.dfg.inst_args(inst).get(0).unwrap();
-                    self.cur.func.dfg.replace(inst).brif(cond, val, new_ebb, &[]);
+                    self.cur
+                        .func
+                        .dfg
+                        .replace(inst)
+                        .brif(cond, val, new_ebb, &[]);
                 }
             }
             Opcode::Brff => {
                 if let InstructionData::BranchFloat { cond, .. } = self.cur.func.dfg[inst] {
                     let val = *self.cur.func.dfg.inst_args(inst).get(0).unwrap();
-                    self.cur.func.dfg.replace(inst).brff(cond, val, new_ebb, &[]);
+                    self.cur
+                        .func
+                        .dfg
+                        .replace(inst)
+                        .brff(cond, val, new_ebb, &[]);
                 }
             }
             _ => {

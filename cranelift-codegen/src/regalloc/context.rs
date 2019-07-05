@@ -94,21 +94,9 @@ impl Context {
         let _tt = timing::regalloc();
         debug_assert!(domtree.is_valid());
 
-        let mut errors = VerifierErrors::default();
-
-        // Pass: Liveness analysis.
-        self.liveness.compute(isa, func, cfg);
-
-        if isa.flags().enable_verifier() {
-            let ok = verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok();
-            if !ok {
-                return Err(errors.into());
-            }
-        }
-
         let errors = match mechanism {
-            Mechanism::Minimal => self.minimal(isa, func, cfg, domtree, errors)?,
-            Mechanism::Coloring => self.graph_coloring(isa, func, cfg, domtree, errors)?,
+            Mechanism::Minimal => self.minimal(isa, func, cfg, domtree)?,
+            Mechanism::Coloring => self.graph_coloring(isa, func, cfg, domtree)?,
         };
 
         // Even if we arrive here, (non-fatal) errors might have been reported, so we
@@ -126,14 +114,25 @@ impl Context {
         func: &mut Function,
         cfg: &mut ControlFlowGraph,
         domtree: &mut DominatorTree,
-        mut errors: VerifierErrors,
     ) -> CodegenResult<VerifierErrors> {
+        let mut errors = VerifierErrors::default();
+
         // `Liveness` and `Coloring` are self-clearing.
         self.virtregs.clear();
 
         // Tracker state (dominator live sets) is actually reused between the spilling and coloring
         // phases.
         self.tracker.clear();
+
+        // Pass: Liveness analysis
+        self.liveness.compute(isa, func, cfg);
+
+        if isa.flags().enable_verifier() {
+            let ok = verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok();
+            if !ok {
+                return Err(errors.into());
+            }
+        }
 
         // Pass: Coalesce and create Conventional SSA form.
         self.coalescing.conventional_ssa(
@@ -266,29 +265,19 @@ impl Context {
         func: &mut Function,
         cfg: &mut ControlFlowGraph,
         domtree: &mut DominatorTree,
-        mut errors: VerifierErrors,
     ) -> CodegenResult<VerifierErrors> {
-        self.tracker.clear();
+        let mut errors = VerifierErrors::default();
 
         self.minimal.run(
             isa,
             func,
             cfg,
             domtree,
-            &mut self.liveness,
             &mut self.topo,
-            &mut self.tracker,
         );
 
-        // Note, cannot verify liveness here because liveness information is destroyed by the
-        // register allocator.  Thus also cannot verify locations.  The regalloc could update the
-        // liveness info, but should only do so if it is needed by the verifier.
-
         if isa.flags().enable_verifier() {
-            let ok = verify_context(func, cfg, domtree, isa, &mut errors).is_ok()
-                //&& verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok()
-                //&& verify_locations(isa, func, Some(&self.liveness), &mut errors).is_ok()
-                ;
+            let ok = verify_context(func, cfg, domtree, isa, &mut errors).is_ok();
             if !ok {
                 return Err(errors.into());
             }
