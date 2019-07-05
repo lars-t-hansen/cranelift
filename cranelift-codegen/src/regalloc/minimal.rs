@@ -228,10 +228,15 @@ impl<'a> Context<'a> {
     }
 
     fn visit_copy(&mut self, inst: Inst) {
-        // As the stack slots are immutable, a copy is simply a sharing of location.
+        // As the stack slots are immutable, a copy is simply a sharing of location.  However, if we
+        // just remove the instruction then its result will have no defining instruction.  So
+        // rewrite as copy_nop instead.
         let arg = self.cur.func.dfg.inst_args(inst)[0];
         let dest = self.cur.func.dfg.inst_results(inst)[0];
         self.cur.func.locations[dest] = self.cur.func.locations[arg];
+        self.cur.func.dfg.replace(inst).copy_nop(arg);
+        let ok = self.cur.func.update_encoding(inst, self.cur.isa).is_ok();
+        debug_assert!(ok, "copy_nop encoding missing for this type");
     }
 
     fn visit_branch(&mut self, inst: Inst, regs: &mut Regs, opcode: Opcode) {
