@@ -204,15 +204,15 @@ impl<'a> Context<'a> {
     fn visit_inst(&mut self, inst: Inst, regs: &mut Regs) {
         let opcode = self.cur.func.dfg[inst].opcode();
         if opcode == Opcode::Copy {
-            self.visit_copy(inst, regs, opcode);
+            self.visit_copy(inst);
         } else if opcode.is_branch() {
             self.visit_branch(inst, regs, opcode);
         } else if opcode.is_terminator() {
-            self.visit_terminator(inst, regs, opcode);
+            self.visit_terminator(inst, opcode);
         } else if opcode.is_call() {
             self.visit_call(inst, regs, opcode);
         } else if opcode == Opcode::Spill && self.is_spill_to_outgoing_arg(inst) {
-            self.visit_outgoing_arg_spill(inst, regs, opcode);
+            self.visit_outgoing_arg_spill(inst, regs);
         } else if opcode == Opcode::Spill || opcode == Opcode::Fill {
             // Inserted by the register allocator; ignore them.
         } else {
@@ -223,11 +223,11 @@ impl<'a> Context<'a> {
                     && opcode != Opcode::Regspill
                     && opcode != Opcode::CopySpecial
             );
-            self.visit_plain_inst(inst, regs, opcode);
+            self.visit_plain_inst(inst, regs);
         }
     }
 
-    fn visit_copy(&mut self, inst: Inst, _regs: &mut Regs, _opcode: Opcode) {
+    fn visit_copy(&mut self, inst: Inst) {
         // As the stack slots are immutable, a copy is simply a sharing of location.
         let arg = self.cur.func.dfg.inst_args(inst)[0];
         let dest = self.cur.func.dfg.inst_results(inst)[0];
@@ -262,7 +262,7 @@ impl<'a> Context<'a> {
                 self.rewrite_side_exit(inst, opcode, new_ebb);
 
                 if has_argument {
-                    self.visit_plain_inst(inst, regs, opcode);
+                    self.visit_plain_inst(inst, regs);
                     orig_inst = self.cur.current_inst().unwrap();
                 }
 
@@ -276,7 +276,7 @@ impl<'a> Context<'a> {
                 self.cur.goto_first_inst(new_ebb);
                 inst = self.cur.current_inst().unwrap();
             } else if has_argument {
-                self.visit_plain_inst(inst, regs, opcode);
+                self.visit_plain_inst(inst, regs);
             }
 
             let arginfo: Vec<_> = self
@@ -296,7 +296,7 @@ impl<'a> Context<'a> {
                 let spill = self.cur.built_inst();
                 let enc = self.cur.func.encodings[spill];
                 let constraints = self.encinfo.operand_constraints(enc).unwrap();
-                let rc = constraints.ins[k].regclass;
+                let rc = constraints.ins[0].regclass;
                 let reg = regs.take(rc).unwrap();
                 self.cur.func.locations[temp] = ValueLoc::Reg(reg);
                 self.cur.func.dfg.inst_args_mut(inst)[k] = dest;
@@ -311,7 +311,7 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn visit_terminator(&mut self, inst: Inst, _regs: &mut Regs, opcode: Opcode) {
+    fn visit_terminator(&mut self, inst: Inst, opcode: Opcode) {
         // Some terminators are handled as branches and should not be seen here; others are illegal.
         match opcode {
             Opcode::Return | Opcode::FallthroughReturn => {
@@ -373,7 +373,8 @@ impl<'a> Context<'a> {
         (from_stack, last)
     }
 
-    fn visit_outgoing_arg_spill(&mut self, inst: Inst, regs: &mut Regs, _opcode: Opcode) {
+    fn visit_outgoing_arg_spill(&mut self, inst: Inst, regs: &mut Regs) {
+        debug_assert!(self.cur.func.dfg[inst].opcode() == Opcode::Spill);
         let arg = self.cur.func.dfg.inst_args(inst)[0];
         let temp = self.cur.ins().fill(arg);
         let enc = self.cur.func.encodings[inst];
@@ -430,7 +431,7 @@ impl<'a> Context<'a> {
         self.cur.goto_inst(last);
     }
 
-    fn visit_plain_inst(&mut self, inst: Inst, regs: &mut Regs, _opcode: Opcode) {
+    fn visit_plain_inst(&mut self, inst: Inst, regs: &mut Regs) {
         let constraints = self
             .encinfo
             .operand_constraints(self.cur.func.encodings[inst]);
