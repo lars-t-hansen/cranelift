@@ -12,9 +12,8 @@
 //! obey all instruction constraints (eg fixed registers and register classes), but is otherwise the
 //! simplest register allocator imaginable for our given IR structure.
 
-// TODO: Can we factor more code?
 // TODO: Can the flags hack be generalized?  The normal regalloc does not need this test.
-// TODO: Feels like there are a few too many special-purpose tests and cases.
+// TODO: Feels like there are a few too many special-purpose tests and cases?
 // TODO: The register set abstraction is probably quite slow, since it creates an iterator
 //       for pretty much every allocation; there are better ways.
 
@@ -321,29 +320,18 @@ impl<'a> Context<'a> {
             .collect();
 
         for (k, (arg, target_arg)) in arginfo {
-            let temp = self.cur.ins().fill(arg);
+            let (temp, rc, reg) = self.fill_temp_register(arg, regs);
             let dest = self.cur.ins().spill(temp);
-            let spill = self.cur.built_inst();
-            let enc = self.cur.func.encodings[spill];
-            let constraints = self.encinfo.operand_constraints(enc).unwrap();
-            let rc = constraints.ins[0].regclass;
-            let reg = regs.take(rc).unwrap();
-            self.cur.func.locations[temp] = ValueLoc::Reg(reg);
             self.cur.func.dfg.inst_args_mut(inst)[k] = dest;
-            regs.free(rc, reg);
             self.cur.func.locations[dest] = self.cur.func.locations[target_arg];
+            regs.free(rc, reg);
         }
     }
 
     fn visit_outgoing_arg_spill(&mut self, inst: Inst, regs: &mut Regs) {
         debug_assert!(self.cur.func.dfg[inst].opcode() == Opcode::Spill);
         let arg = self.cur.func.dfg.inst_args(inst)[0];
-        let temp = self.cur.ins().fill(arg);
-        let enc = self.cur.func.encodings[inst];
-        let constraints = self.encinfo.operand_constraints(enc).unwrap();
-        let rc = constraints.ins[0].regclass;
-        let reg = regs.take(rc).unwrap();
-        self.cur.func.locations[temp] = ValueLoc::Reg(reg);
+        let (temp, rc, reg) = self.fill_temp_register(arg, regs);
         self.cur.func.dfg.inst_args_mut(inst)[0] = temp;
         regs.free(rc, reg);
     }
@@ -549,6 +537,18 @@ impl<'a> Context<'a> {
         spill
     }
 
+    /// Create a new Value allocated to a register and load `val` into it.
+    fn fill_temp_register(&mut self, val: Value, regs: &mut Regs) -> (Value, RegClass, RegUnit) {
+        let temp = self.cur.ins().fill(val);
+        let fill = self.cur.built_inst();
+        let enc = self.cur.func.encodings[fill];
+        let constraints = self.encinfo.operand_constraints(enc).unwrap();
+        let rc = constraints.ins[0].regclass;
+        let reg = regs.take(rc).unwrap();
+        self.cur.func.locations[temp] = ValueLoc::Reg(reg);
+        (temp, rc, reg)
+    }
+
     fn is_spill_to_outgoing_arg(&self, inst: Inst) -> bool {
         debug_assert!(self.cur.func.dfg[inst].opcode() == Opcode::Spill);
         let result = self.cur.func.dfg.inst_results(inst)[0];
@@ -641,8 +641,8 @@ impl<'a> Context<'a> {
             InstructionData::Branch { destination, .. } => destination,
             InstructionData::BranchIcmp { destination, .. } => destination,
             InstructionData::BranchInt { destination, .. } => destination,
-            InstructionData::BranchFloat { destination, .. } => destination, 
-            _ => panic!("Unexpected instruction in classify_branch")
+            InstructionData::BranchFloat { destination, .. } => destination,
+            _ => panic!("Unexpected instruction in classify_branch"),
         }
     }
 
