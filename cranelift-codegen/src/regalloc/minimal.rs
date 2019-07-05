@@ -22,7 +22,7 @@ use crate::dominator_tree::DominatorTree;
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::{
     AbiParam, ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode,
-    StackSlotKind, Value, ValueLoc,
+    StackSlotKind, Type, Value, ValueLoc,
 };
 use crate::isa::registers::{RegClass, RegUnit};
 use crate::isa::{ConstraintKind, EncInfo, TargetIsa};
@@ -162,11 +162,7 @@ impl<'a> Context<'a> {
             match abi.location {
                 ArgumentLoc::Reg(reg) => {
                     let new_param = self.cur.func.dfg.replace_ebb_param(param, abi.value_type);
-                    self.cur.func.locations[new_param] = ValueLoc::Reg(reg);
-                    self.cur.ins().with_result(param).spill(new_param);
-
-                    let ss = self.cur.func.stack_slots.make_spill_slot(abi.value_type);
-                    self.cur.func.locations[param] = ValueLoc::Stack(ss);
+                    self.spill_register(reg, new_param, param, abi.value_type);
                 }
                 ArgumentLoc::Stack(_offset) => {
                     // Incoming stack arguments have sensible pre-initialized locations.
@@ -233,8 +229,8 @@ impl<'a> Context<'a> {
 
     fn visit_copy(&mut self, inst: Inst, _regs: &mut Regs, _opcode: Opcode) {
         // As the stack slots are immutable, a copy is simply a sharing of location.
-        let arg = *self.cur.func.dfg.inst_args(inst).get(0).unwrap();
-        let dest = *self.cur.func.dfg.inst_results(inst).get(0).unwrap();
+        let arg = self.cur.func.dfg.inst_args(inst)[0];
+        let dest = self.cur.func.dfg.inst_results(inst)[0];
         self.cur.func.locations[dest] = self.cur.func.locations[arg];
     }
 
@@ -300,12 +296,12 @@ impl<'a> Context<'a> {
                 let spill = self.cur.built_inst();
                 let enc = self.cur.func.encodings[spill];
                 let constraints = self.encinfo.operand_constraints(enc).unwrap();
-                let rc = constraints.ins[0].regclass;
+                let rc = constraints.ins[k].regclass;
                 let reg = regs.take(rc).unwrap();
                 self.cur.func.locations[temp] = ValueLoc::Reg(reg);
-                self.cur.func.locations[dest] = self.cur.func.locations[target_arg];
                 self.cur.func.dfg.inst_args_mut(inst)[k] = dest;
                 regs.free(rc, reg);
+                self.cur.func.locations[dest] = self.cur.func.locations[target_arg];
             }
 
             // Restore the point, so that the iteration will work correctly.
@@ -366,7 +362,7 @@ impl<'a> Context<'a> {
         for (_, (result, abi)) in abi_info {
             match abi.location {
                 ArgumentLoc::Reg(reg) => {
-                    last = self.spill_from_register(*result, reg);
+                    last = self.spill_result_from_register(*result, reg);
                     self.cur.goto_after_inst(last);
                 }
                 _ => {
@@ -380,20 +376,43 @@ impl<'a> Context<'a> {
     fn visit_outgoing_arg_spill(&mut self, inst: Inst, regs: &mut Regs, _opcode: Opcode) {
         let arg = self.cur.func.dfg.inst_args(inst)[0];
         let temp = self.cur.ins().fill(arg);
-        self.cur.func.dfg.inst_args_mut(inst)[0] = temp;
         let enc = self.cur.func.encodings[inst];
         let constraints = self.encinfo.operand_constraints(enc).unwrap();
         let rc = constraints.ins[0].regclass;
         let reg = regs.take(rc).unwrap();
         self.cur.func.locations[temp] = ValueLoc::Reg(reg);
+        self.cur.func.dfg.inst_args_mut(inst)[0] = temp;
         regs.free(rc, reg);
     }
 
+    // FIXME: call_indirect does not work properly
+    //
+    // Are there fixed constraints on some of the argument values?
+    // Are there some strange orderings of parameters that need to be obeyed?
+    //
+    // For call-indirect, the constraints.ins provides constraints on fixed instruction arguments (namely,
+    // the first one goes into a GPR) and the call parameters are the variable arguments, and those are
+    // the ones we must process for the call.
+
     fn visit_call(&mut self, inst: Inst, _regs: &mut Regs, _opcode: Opcode) {
+        // So we want to load the variable args into ABI registers (and take these registers from the regs)
+        // And then load the fixed args into GPRs
+        dbg!(self.cur.func.dfg.inst_args(inst));
+        dbg!(self.cur.func.dfg.inst_variable_args(inst));
+        let enc = self.cur.func.encodings[inst];
+        let constraints = self.encinfo.operand_constraints(enc).unwrap();
+        dbg!(constraints.ins);
+        dbg!(constraints.outs);
+
+        let sig = self.cur.func.dfg.call_signature(inst).unwrap();
+        dbg!(&self.cur.func.dfg.signatures[sig].params);
+
         // Setup register arguments
         let arg_info = self.make_abi_info(
+            // inst_args is wrong because that includes the table index for call_indirect, which
+            // needs to be passed differently (i think).
             self.cur.func.dfg.inst_args(inst),
-            &self.cur.func.signature.params,
+            &self.cur.func.dfg.signatures[sig].params,
         );
         self.load_abi_registers(inst, &arg_info);
 
@@ -403,7 +422,7 @@ impl<'a> Context<'a> {
         // Capture results
         let result_info = self.make_abi_info(
             self.cur.func.dfg.inst_results(inst),
-            &self.cur.func.signature.returns,
+            &self.cur.func.dfg.signatures[sig].returns,
         );
         let (from_stack, last) = self.store_abi_registers(inst, &result_info);
         debug_assert!(!from_stack);
@@ -514,7 +533,7 @@ impl<'a> Context<'a> {
             if value_type.is_flags() {
                 self.cur.func.locations[result] = ValueLoc::Reg(reg);
             } else {
-                last = self.spill_from_register(result, reg);
+                last = self.spill_result_from_register(result, reg);
                 self.cur.goto_after_inst(last);
             }
 
@@ -523,16 +542,18 @@ impl<'a> Context<'a> {
         self.cur.goto_inst(last);
     }
 
-    fn spill_from_register(&mut self, result: Value, reg: RegUnit) -> Inst {
+    fn spill_result_from_register(&mut self, result: Value, reg: RegUnit) -> Inst {
         let value_type = self.cur.func.dfg.value_type(result);
         let new_result = self.cur.func.dfg.replace_result(result, value_type);
-        self.cur.func.locations[new_result] = ValueLoc::Reg(reg);
+        self.spill_register(reg, new_result, result, value_type)
+    }
 
-        self.cur.ins().with_result(result).spill(new_result);
+    fn spill_register(&mut self, reg: RegUnit, regname: Value, stackname: Value, value_type: Type) -> Inst {
+        self.cur.func.locations[regname] = ValueLoc::Reg(reg);
+        self.cur.ins().with_result(stackname).spill(regname);
         let spill = self.cur.built_inst();
         let ss = self.cur.func.stack_slots.make_spill_slot(value_type);
-        self.cur.func.locations[result] = ValueLoc::Stack(ss);
-
+        self.cur.func.locations[stackname] = ValueLoc::Stack(ss);
         spill
     }
 
@@ -584,17 +605,17 @@ impl<'a> Context<'a> {
     fn rewrite_side_exit(&mut self, inst: Inst, opcode: Opcode, new_ebb: Ebb) {
         match opcode {
             Opcode::Brz => {
-                let val = *self.cur.func.dfg.inst_args(inst).get(0).unwrap();
+                let val = self.cur.func.dfg.inst_args(inst)[0];
                 self.cur.func.dfg.replace(inst).brz(val, new_ebb, &[]);
             }
             Opcode::Brnz => {
-                let val = *self.cur.func.dfg.inst_args(inst).get(0).unwrap();
+                let val = self.cur.func.dfg.inst_args(inst)[0];
                 self.cur.func.dfg.replace(inst).brnz(val, new_ebb, &[]);
             }
             Opcode::BrIcmp => {
                 if let InstructionData::BranchIcmp { cond, .. } = self.cur.func.dfg[inst] {
-                    let x = *self.cur.func.dfg.inst_args(inst).get(0).unwrap();
-                    let y = *self.cur.func.dfg.inst_args(inst).get(1).unwrap();
+                    let x = self.cur.func.dfg.inst_args(inst)[0];
+                    let y = self.cur.func.dfg.inst_args(inst)[0];
                     self.cur
                         .func
                         .dfg
@@ -604,7 +625,7 @@ impl<'a> Context<'a> {
             }
             Opcode::Brif => {
                 if let InstructionData::BranchInt { cond, .. } = self.cur.func.dfg[inst] {
-                    let val = *self.cur.func.dfg.inst_args(inst).get(0).unwrap();
+                    let val = self.cur.func.dfg.inst_args(inst)[0];
                     self.cur
                         .func
                         .dfg
@@ -614,7 +635,7 @@ impl<'a> Context<'a> {
             }
             Opcode::Brff => {
                 if let InstructionData::BranchFloat { cond, .. } = self.cur.func.dfg[inst] {
-                    let val = *self.cur.func.dfg.inst_args(inst).get(0).unwrap();
+                    let val = self.cur.func.dfg.inst_args(inst)[0];
                     self.cur
                         .func
                         .dfg
