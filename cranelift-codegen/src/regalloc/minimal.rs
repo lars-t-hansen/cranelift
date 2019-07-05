@@ -262,7 +262,7 @@ impl<'a> Context<'a> {
                 self.rewrite_side_exit(inst, opcode, new_ebb);
 
                 if has_argument {
-                    self.visit_plain_inst(inst, regs);
+                    self.fill_register_args(inst, regs, true);
                     orig_inst = self.cur.current_inst().unwrap();
                 }
 
@@ -276,7 +276,7 @@ impl<'a> Context<'a> {
                 self.cur.goto_first_inst(new_ebb);
                 inst = self.cur.current_inst().unwrap();
             } else if has_argument {
-                self.visit_plain_inst(inst, regs);
+                self.fill_register_args(inst, regs, true);
             }
 
             let arginfo: Vec<_> = self
@@ -342,7 +342,7 @@ impl<'a> Context<'a> {
                 ArgumentLoc::Reg(r) => {
                     let temp = self.cur.ins().fill(*val);
                     self.cur.func.locations[temp] = ValueLoc::Reg(r);
-                    self.cur.func.dfg.inst_args_mut(inst)[*k] = temp;
+                    self.cur.func.dfg.inst_variable_args_mut(inst)[*k] = temp;
                 }
                 _ => {
                     to_stack = true;
@@ -386,36 +386,39 @@ impl<'a> Context<'a> {
         regs.free(rc, reg);
     }
 
-    // FIXME: call_indirect does not work properly
-    //
-    // Are there fixed constraints on some of the argument values?
-    // Are there some strange orderings of parameters that need to be obeyed?
-    //
-    // For call-indirect, the constraints.ins provides constraints on fixed instruction arguments (namely,
-    // the first one goes into a GPR) and the call parameters are the variable arguments, and those are
-    // the ones we must process for the call.
-
-    fn visit_call(&mut self, inst: Inst, _regs: &mut Regs, _opcode: Opcode) {
-        // So we want to load the variable args into ABI registers (and take these registers from the regs)
-        // And then load the fixed args into GPRs
-        dbg!(self.cur.func.dfg.inst_args(inst));
-        dbg!(self.cur.func.dfg.inst_variable_args(inst));
+    fn visit_call(&mut self, inst: Inst, regs: &mut Regs, _opcode: Opcode) {
         let enc = self.cur.func.encodings[inst];
         let constraints = self.encinfo.operand_constraints(enc).unwrap();
-        dbg!(constraints.ins);
-        dbg!(constraints.outs);
 
         let sig = self.cur.func.dfg.call_signature(inst).unwrap();
-        dbg!(&self.cur.func.dfg.signatures[sig].params);
 
         // Setup register arguments
         let arg_info = self.make_abi_info(
-            // inst_args is wrong because that includes the table index for call_indirect, which
-            // needs to be passed differently (i think).
-            self.cur.func.dfg.inst_args(inst),
+            self.cur.func.dfg.inst_variable_args(inst),
             &self.cur.func.dfg.signatures[sig].params,
         );
         self.load_abi_registers(inst, &arg_info);
+
+        // Reserve the ABI registers so we don't reuse them for any fixed args.
+        for (k, (val, abi)) in &arg_info {
+            if let ArgumentLoc::Reg(r) = abi.location {
+                let ty = self.cur.func.dfg.value_type(*val);
+                let rc = self.cur.isa.regclass_for_abi_type(ty).into();
+                regs.take_specific(rc, r);
+            }
+        }
+
+        // Load fixed args.
+        self.fill_register_args(inst, regs, true);
+
+        // Unreserve the ABI registers.
+        for (k, (val, abi)) in &arg_info {
+            if let ArgumentLoc::Reg(r) = abi.location {
+                let ty = self.cur.func.dfg.value_type(*val);
+                let rc = self.cur.isa.regclass_for_abi_type(ty).into();
+                regs.free(rc, r);
+            }
+        }
 
         // Move past the instruction
         self.cur.goto_after_inst(inst);
@@ -432,6 +435,14 @@ impl<'a> Context<'a> {
     }
 
     fn visit_plain_inst(&mut self, inst: Inst, regs: &mut Regs) {
+        let reg_args = self.fill_register_args(inst, regs, false);
+        self.spill_register_results(inst, regs, reg_args);
+    }
+
+    // This will not free any tied registers it allocates.  It leaves the point at `inst`.  The
+    // return value reflects the allocated registers (all of them), some of which may no longer have
+    // been taken from regs.
+    fn fill_register_args(&mut self, inst: Inst, regs: &mut Regs, fixed: bool) -> Vec<(usize, Value, RegClass, RegUnit, bool)> {
         let constraints = self
             .encinfo
             .operand_constraints(self.cur.func.encodings[inst]);
@@ -451,7 +462,7 @@ impl<'a> Context<'a> {
 
         // Assign all input registers.
         let mut reg_args = vec![];
-        for (k, arg) in self.cur.func.dfg.inst_args(inst).iter().enumerate() {
+        for (k, arg) in if fixed { self.cur.func.dfg.inst_fixed_args(inst) } else { self.cur.func.dfg.inst_args(inst) }.iter().enumerate() {
             debug_assert!(
                 if let ValueLoc::Stack(_ss) = self.cur.func.locations[*arg] {
                     true
@@ -482,12 +493,26 @@ impl<'a> Context<'a> {
             } else {
                 let temp = self.cur.ins().fill(*arg);
                 self.cur.func.locations[temp] = ValueLoc::Reg(*reg);
-                self.cur.func.dfg.inst_args_mut(inst)[*k] = temp;
+                if fixed {
+                    self.cur.func.dfg.inst_fixed_args_mut(inst)[*k] = temp;
+                } else {
+                    self.cur.func.dfg.inst_args_mut(inst)[*k] = temp;
+                }
             }
             if !*is_tied {
                 regs.free(*rc, *reg);
             }
         }
+
+        reg_args
+    }
+
+    // This will assume that tied registers are already allocated.  It leaves the point at the last
+    // instruction inserted after `inst`, if any.
+    fn spill_register_results(&mut self, inst: Inst, regs: &mut Regs, reg_args: Vec<(usize, Value, RegClass, RegUnit, bool)>) {
+        let constraints = self
+            .encinfo
+            .operand_constraints(self.cur.func.encodings[inst]);
 
         // Reserve any fixed output registers that are not also tied.
         if let Some(constraints) = constraints {
