@@ -13,7 +13,7 @@ mod affinity;
 mod coalescing;
 mod context;
 mod diversion;
-mod minimal;
+mod minimal_alloc;
 mod pressure;
 mod reload;
 mod safepoint;
