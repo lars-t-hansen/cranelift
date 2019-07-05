@@ -13,6 +13,17 @@
 //! simplest register allocator imaginable for our given IR structure.
 
 // TODO: Can the flags hack be generalized?  The normal regalloc does not need this test.
+//       The isa has a uses_cpu_flags() thing that might be a useful guard?  Only postopt.rs
+//         uses this to guard flags-specific optimizations.
+//       There's the clobbers_flags on the RecipeConstraints, probably not what we want.
+//       verifier/flags.rs and postopt.rs are interesting but not enlightening, exactly.
+//       Some tests have interesting rc_by_name functionality that selects specific
+//         register classes, probably not portable but it's possible the GC allocator
+//         selects non-flag classes specifically for something.
+//       I guess flags are sort of avoided if one looks at the results of the instruction
+//         "just so", eg in terms of the live value tracker
+//       => Could it be that the ValueLoc is already assigned in all cases for ValueLoc::Reg?
+//          But then what is the Reg?
 // TODO: Feels like there are a few too many special-purpose tests and cases?
 // TODO: The register set abstraction is probably quite slow, since it creates an iterator
 //       for pretty much every allocation; there are better ways.
@@ -93,7 +104,7 @@ impl Regs {
 }
 
 struct Context<'a> {
-    // True if new blocks were inserted
+    // True if new blocks were inserted.
     new_blocks: bool,
 
     // Set of registers that the allocator can use.
