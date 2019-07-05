@@ -308,6 +308,8 @@ impl<'a> Context<'a> {
             if new_block {
                 self.cur.goto_inst(orig_inst);
             }
+        } else if has_argument {
+            self.fill_register_args(inst, regs, true);
         }
     }
 
