@@ -8,6 +8,7 @@ use crate::dominator_tree::DominatorTree;
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::Function;
 use crate::isa::TargetIsa;
+use crate::regalloc::branch_splitting;
 use crate::regalloc::coalescing::Coalescing;
 use crate::regalloc::coloring::Coloring;
 use crate::regalloc::live_value_tracker::LiveValueTracker;
@@ -267,6 +268,8 @@ impl Context {
         domtree: &mut DominatorTree,
     ) -> CodegenResult<VerifierErrors> {
         let mut errors = VerifierErrors::default();
+
+        branch_splitting::run(isa, func, cfg, domtree, &mut self.topo);
 
         self.minimal.run(isa, func, cfg, domtree, &mut self.topo);
 
