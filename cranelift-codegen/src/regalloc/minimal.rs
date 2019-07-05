@@ -12,8 +12,13 @@
 //! obey all instruction constraints (eg fixed registers and register classes), but is otherwise the
 //! simplest register allocator imaginable for our given IR structure.
 
-// TODO: can we factor more code?
-// TODO: can the flags hack be generalized?
+// TODO: Can we factor more code?
+// TODO: Can the flags hack be generalized?  The normal regalloc does not need this test.
+// TODO: Refactor the branch / jump / terminator distinction, since branches are weird and
+//       all non-branches are actually terminators.
+// TODO: Feels like there are a few too many special-purpose tests and cases.
+// TODO: The register set abstraction is probably quite slow, since it creates an iterator
+//       for pretty much every allocation; there are better ways.
 
 use std::vec::Vec;
 
@@ -77,7 +82,6 @@ impl Regs {
     }
 
     fn take(&mut self, rc: RegClass) -> Option<RegUnit> {
-        // FIXME: This is probably quite slow.
         let mut i = self.registers.iter(rc);
         let r = i.next();
         if r.is_some() {
@@ -143,7 +147,6 @@ impl<'a> Context<'a> {
         }
 
         dbg!(&self.cur.func);
-        dbg!(&self.cur.func.locations);
     }
 
     fn visit_entry_block(&mut self, entry: Ebb) {
@@ -326,58 +329,12 @@ impl<'a> Context<'a> {
                     self.cur.func.dfg.inst_args(inst),
                     &self.cur.func.signature.returns,
                 );
-                let to_stack = self.load_abi_registers(inst, &abi_info);
+                let to_stack = self.load_variable_abi_registers(inst, &abi_info);
                 debug_assert!(!to_stack);
             }
             Opcode::Trap => {}
             _ => unreachable!(),
         }
-    }
-
-    fn make_abi_info(&self, vals: &[Value], abi: &[AbiParam]) -> Vec<(usize, (Value, AbiParam))> {
-        vals.iter()
-            .zip(abi)
-            .map(|(val, abi)| (*val, *abi))
-            .enumerate()
-            .collect()
-    }
-
-    fn load_abi_registers(&mut self, inst: Inst, abi_info: &[(usize, (Value, AbiParam))]) -> bool {
-        let mut to_stack = false;
-        for (k, (val, abi)) in abi_info {
-            match abi.location {
-                ArgumentLoc::Reg(r) => {
-                    let temp = self.cur.ins().fill(*val);
-                    self.cur.func.locations[temp] = ValueLoc::Reg(r);
-                    self.cur.func.dfg.inst_variable_args_mut(inst)[*k] = temp;
-                }
-                _ => {
-                    to_stack = true;
-                }
-            }
-        }
-        to_stack
-    }
-
-    fn store_abi_registers(
-        &mut self,
-        inst: Inst,
-        abi_info: &[(usize, (Value, AbiParam))],
-    ) -> (bool, Inst) {
-        let mut from_stack = false;
-        let mut last = inst;
-        for (_, (result, abi)) in abi_info {
-            match abi.location {
-                ArgumentLoc::Reg(reg) => {
-                    last = self.spill_result_from_register(*result, reg);
-                    self.cur.goto_after_inst(last);
-                }
-                _ => {
-                    from_stack = true;
-                }
-            }
-        }
-        (from_stack, last)
     }
 
     fn visit_outgoing_arg_spill(&mut self, inst: Inst, regs: &mut Regs) {
@@ -394,48 +351,29 @@ impl<'a> Context<'a> {
     }
 
     fn visit_call(&mut self, inst: Inst, regs: &mut Regs, _opcode: Opcode) {
-        let enc = self.cur.func.encodings[inst];
-        let constraints = self.encinfo.operand_constraints(enc).unwrap();
-
         let sig = self.cur.func.dfg.call_signature(inst).unwrap();
 
-        // Setup register arguments
+        // Setup ABI register arguments
         let arg_info = self.make_abi_info(
             self.cur.func.dfg.inst_variable_args(inst),
             &self.cur.func.dfg.signatures[sig].params,
         );
-        self.load_abi_registers(inst, &arg_info);
+        self.load_variable_abi_registers(inst, &arg_info);
 
-        // Reserve the ABI registers so we don't reuse them for any fixed args.
-        for (k, (val, abi)) in &arg_info {
-            if let ArgumentLoc::Reg(r) = abi.location {
-                let ty = self.cur.func.dfg.value_type(*val);
-                let rc = self.cur.isa.regclass_for_abi_type(ty).into();
-                regs.take_specific(rc, r);
-            }
-        }
-
-        // Load fixed args.
+        // Load fixed args, avoiding ABI registers.
+        self.take_variable_abi_registers(&arg_info, regs);
         self.fill_register_args(inst, regs, true);
-
-        // Unreserve the ABI registers.
-        for (k, (val, abi)) in &arg_info {
-            if let ArgumentLoc::Reg(r) = abi.location {
-                let ty = self.cur.func.dfg.value_type(*val);
-                let rc = self.cur.isa.regclass_for_abi_type(ty).into();
-                regs.free(rc, r);
-            }
-        }
+        self.free_variable_abi_registers(&arg_info, regs);
 
         // Move past the instruction
         self.cur.goto_after_inst(inst);
 
-        // Capture results
+        // Capture ABI results
         let result_info = self.make_abi_info(
             self.cur.func.dfg.inst_results(inst),
             &self.cur.func.dfg.signatures[sig].returns,
         );
-        let (from_stack, last) = self.store_abi_registers(inst, &result_info);
+        let (from_stack, last) = self.store_variable_abi_registers(inst, &result_info);
         debug_assert!(!from_stack);
 
         self.cur.goto_inst(last);
@@ -449,7 +387,12 @@ impl<'a> Context<'a> {
     // This will not free any tied registers it allocates.  It leaves the point at `inst`.  The
     // return value reflects the allocated registers (all of them), some of which may no longer have
     // been taken from regs.
-    fn fill_register_args(&mut self, inst: Inst, regs: &mut Regs, fixed: bool) -> Vec<(usize, Value, RegClass, RegUnit, bool)> {
+    fn fill_register_args(
+        &mut self,
+        inst: Inst,
+        regs: &mut Regs,
+        fixed: bool,
+    ) -> Vec<(usize, Value, RegClass, RegUnit, bool)> {
         let constraints = self
             .encinfo
             .operand_constraints(self.cur.func.encodings[inst]);
@@ -469,7 +412,14 @@ impl<'a> Context<'a> {
 
         // Assign all input registers.
         let mut reg_args = vec![];
-        for (k, arg) in if fixed { self.cur.func.dfg.inst_fixed_args(inst) } else { self.cur.func.dfg.inst_args(inst) }.iter().enumerate() {
+        for (k, arg) in if fixed {
+            self.cur.func.dfg.inst_fixed_args(inst)
+        } else {
+            self.cur.func.dfg.inst_args(inst)
+        }
+        .iter()
+        .enumerate()
+        {
             debug_assert!(
                 if let ValueLoc::Stack(_ss) = self.cur.func.locations[*arg] {
                     true
@@ -516,7 +466,12 @@ impl<'a> Context<'a> {
 
     // This will assume that tied registers are already allocated.  It leaves the point at the last
     // instruction inserted after `inst`, if any.
-    fn spill_register_results(&mut self, inst: Inst, regs: &mut Regs, reg_args: Vec<(usize, Value, RegClass, RegUnit, bool)>) {
+    fn spill_register_results(
+        &mut self,
+        inst: Inst,
+        regs: &mut Regs,
+        reg_args: Vec<(usize, Value, RegClass, RegUnit, bool)>,
+    ) {
         let constraints = self
             .encinfo
             .operand_constraints(self.cur.func.encodings[inst]);
@@ -581,7 +536,13 @@ impl<'a> Context<'a> {
         self.spill_register(reg, new_result, result, value_type)
     }
 
-    fn spill_register(&mut self, reg: RegUnit, regname: Value, stackname: Value, value_type: Type) -> Inst {
+    fn spill_register(
+        &mut self,
+        reg: RegUnit,
+        regname: Value,
+        stackname: Value,
+        value_type: Type,
+    ) -> Inst {
         self.cur.func.locations[regname] = ValueLoc::Reg(reg);
         self.cur.ins().with_result(stackname).spill(regname);
         let spill = self.cur.built_inst();
@@ -597,6 +558,84 @@ impl<'a> Context<'a> {
             return self.cur.func.stack_slots[ss].kind == StackSlotKind::OutgoingArg;
         }
         false
+    }
+
+    fn make_abi_info(&self, vals: &[Value], abi: &[AbiParam]) -> Vec<(usize, (Value, AbiParam))> {
+        vals.iter()
+            .zip(abi)
+            .map(|(val, abi)| (*val, *abi))
+            .enumerate()
+            .collect()
+    }
+
+    fn take_variable_abi_registers(
+        &self,
+        abi_info: &[(usize, (Value, AbiParam))],
+        regs: &mut Regs,
+    ) {
+        for (_, (val, abi)) in abi_info {
+            if let ArgumentLoc::Reg(r) = abi.location {
+                let ty = self.cur.func.dfg.value_type(*val);
+                let rc = self.cur.isa.regclass_for_abi_type(ty).into();
+                regs.take_specific(rc, r);
+            }
+        }
+    }
+
+    fn free_variable_abi_registers(
+        &self,
+        abi_info: &[(usize, (Value, AbiParam))],
+        regs: &mut Regs,
+    ) {
+        for (_, (val, abi)) in abi_info {
+            if let ArgumentLoc::Reg(r) = abi.location {
+                let ty = self.cur.func.dfg.value_type(*val);
+                let rc = self.cur.isa.regclass_for_abi_type(ty).into();
+                regs.free(rc, r);
+            }
+        }
+    }
+
+    fn load_variable_abi_registers(
+        &mut self,
+        inst: Inst,
+        abi_info: &[(usize, (Value, AbiParam))],
+    ) -> bool {
+        let mut to_stack = false;
+        for (k, (val, abi)) in abi_info {
+            match abi.location {
+                ArgumentLoc::Reg(r) => {
+                    let temp = self.cur.ins().fill(*val);
+                    self.cur.func.locations[temp] = ValueLoc::Reg(r);
+                    self.cur.func.dfg.inst_variable_args_mut(inst)[*k] = temp;
+                }
+                _ => {
+                    to_stack = true;
+                }
+            }
+        }
+        to_stack
+    }
+
+    fn store_variable_abi_registers(
+        &mut self,
+        inst: Inst,
+        abi_info: &[(usize, (Value, AbiParam))],
+    ) -> (bool, Inst) {
+        let mut from_stack = false;
+        let mut last = inst;
+        for (_, (result, abi)) in abi_info {
+            match abi.location {
+                ArgumentLoc::Reg(reg) => {
+                    last = self.spill_result_from_register(*result, reg);
+                    self.cur.goto_after_inst(last);
+                }
+                _ => {
+                    from_stack = true;
+                }
+            }
+        }
+        (from_stack, last)
     }
 
     // Returns (Option<(target_ebb, side_exit)>, has_argument)

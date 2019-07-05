@@ -268,13 +268,7 @@ impl Context {
     ) -> CodegenResult<VerifierErrors> {
         let mut errors = VerifierErrors::default();
 
-        self.minimal.run(
-            isa,
-            func,
-            cfg,
-            domtree,
-            &mut self.topo,
-        );
+        self.minimal.run(isa, func, cfg, domtree, &mut self.topo);
 
         if isa.flags().enable_verifier() {
             let ok = verify_context(func, cfg, domtree, isa, &mut errors).is_ok();
