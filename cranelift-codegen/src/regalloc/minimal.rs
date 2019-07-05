@@ -14,8 +14,6 @@
 
 // TODO: Can we factor more code?
 // TODO: Can the flags hack be generalized?  The normal regalloc does not need this test.
-// TODO: Refactor the branch / jump / terminator distinction, since branches are weird and
-//       all non-branches are actually terminators.
 // TODO: Feels like there are a few too many special-purpose tests and cases.
 // TODO: The register set abstraction is probably quite slow, since it creates an iterator
 //       for pretty much every allocation; there are better ways.
@@ -208,10 +206,10 @@ impl<'a> Context<'a> {
         let opcode = self.cur.func.dfg[inst].opcode();
         if opcode == Opcode::Copy {
             self.visit_copy(inst);
+        } else if opcode.is_terminator() {
+            self.visit_terminator(inst, regs, opcode);
         } else if opcode.is_branch() {
             self.visit_branch(inst, regs, opcode);
-        } else if opcode.is_terminator() {
-            self.visit_terminator(inst, opcode);
         } else if opcode.is_call() {
             self.visit_call(inst, regs, opcode);
         } else if opcode == Opcode::Spill && self.is_spill_to_outgoing_arg(inst) {
@@ -243,86 +241,49 @@ impl<'a> Context<'a> {
     }
 
     fn visit_branch(&mut self, inst: Inst, regs: &mut Regs, opcode: Opcode) {
-        let (target_info, has_argument) = self.classify_branch(inst, opcode);
-        if let Some((target, side_exit)) = target_info {
-            // Insert the fill/spill along the taken edge only.  May have to create a new block to
-            // hold the fill/spill instructions.
+        let target = self.branch_target(inst);
 
-            let mut inst = inst;
-            let mut orig_inst = inst;
-
-            let new_block = side_exit && self.cur.func.dfg.ebb_params(target).len() > 0;
-            if new_block {
-                // Remember the arguments to the side exit.
-                let jump_args: Vec<Value> = self
-                    .cur
-                    .func
-                    .dfg
-                    .inst_variable_args(inst)
-                    .iter()
-                    .map(|x| *x)
-                    .collect();
-
-                // Create the block the side exit will jump to.
-                let new_ebb = self.make_empty_ebb();
-
-                // Remove the arguments from the side exit and make it jump to the new block.
-                self.rewrite_side_exit(inst, opcode, new_ebb);
-
-                if has_argument {
-                    self.fill_register_args(inst, regs, true);
-                    orig_inst = self.cur.current_inst().unwrap();
-                }
-
-                // Insert a jump to the original target with the original arguments into the new
-                // block.
-                self.cur.goto_first_insertion_point(new_ebb);
-                self.cur.ins().jump(target, jump_args.as_slice());
-
-                // Make the fill/spill code below target the jump instruction in the new block,
-                // otherwise it won't be visited, as it is not in the current topo order.
-                self.cur.goto_first_inst(new_ebb);
-                inst = self.cur.current_inst().unwrap();
-            } else if has_argument {
-                self.fill_register_args(inst, regs, true);
-            }
-
-            let arginfo: Vec<_> = self
+        // If there are any parameters, insert the fill/spill along the taken edge.  Must always
+        // create a new block to hold the fill/spill instructions, as values need to be set up
+        // before we enter the target block.
+        if self.cur.func.dfg.ebb_params(target).len() > 0 {
+            // Remember the branch arguments.
+            let jump_args: Vec<Value> = self
                 .cur
                 .func
                 .dfg
-                .ebb_params(target)
+                .inst_variable_args(inst)
                 .iter()
-                .zip(self.cur.func.dfg.inst_args(inst).iter())
-                .map(|(a, b)| (*b, *a))
-                .enumerate()
+                .map(|x| *x)
                 .collect();
 
-            for (k, (arg, target_arg)) in arginfo {
-                let temp = self.cur.ins().fill(arg);
-                let dest = self.cur.ins().spill(temp);
-                let spill = self.cur.built_inst();
-                let enc = self.cur.func.encodings[spill];
-                let constraints = self.encinfo.operand_constraints(enc).unwrap();
-                let rc = constraints.ins[0].regclass;
-                let reg = regs.take(rc).unwrap();
-                self.cur.func.locations[temp] = ValueLoc::Reg(reg);
-                self.cur.func.dfg.inst_args_mut(inst)[k] = dest;
-                regs.free(rc, reg);
-                self.cur.func.locations[dest] = self.cur.func.locations[target_arg];
-            }
+            // Create the block the branch will jump to.
+            let new_ebb = self.make_empty_ebb();
 
-            // Restore the point, so that the iteration will work correctly.
-            if new_block {
-                self.cur.goto_inst(orig_inst);
-            }
-        } else if has_argument {
+            // Remove the arguments from the branch and make it jump to the new block.
+            self.rewrite_branch(inst, opcode, new_ebb);
+
+            // Load the branch arguments into registers.
+            self.fill_register_args(inst, regs, true);
+
+            // Insert a jump to the original target with the original arguments into the new block.
+            self.cur.goto_first_insertion_point(new_ebb);
+            self.cur.ins().jump(target, jump_args.as_slice());
+
+            // Insert any fills/spills for the edge in the new block.
+            self.cur.goto_first_inst(new_ebb);
+            let jump_inst = self.cur.current_inst().unwrap();
+            self.move_ebb_arguments(target, jump_inst, regs);
+
+            // Reset the cursor to point to the branch.
+            self.cur.goto_inst(inst);
+        } else {
+            // Load the branch arguments into registers.
             self.fill_register_args(inst, regs, true);
         }
     }
 
-    fn visit_terminator(&mut self, inst: Inst, opcode: Opcode) {
-        // Some terminators are handled as branches and should not be seen here; others are illegal.
+    fn visit_terminator(&mut self, inst: Inst, regs: &mut Regs, opcode: Opcode) {
         match opcode {
             Opcode::Return | Opcode::FallthroughReturn => {
                 let abi_info = self.make_abi_info(
@@ -332,8 +293,45 @@ impl<'a> Context<'a> {
                 let to_stack = self.load_variable_abi_registers(inst, &abi_info);
                 debug_assert!(!to_stack);
             }
+            Opcode::IndirectJumpTableBr => {
+                self.fill_register_args(inst, regs, true);
+            }
+            Opcode::Jump => {
+                if let InstructionData::Jump { destination, .. } = self.cur.func.dfg[inst] {
+                    self.move_ebb_arguments(destination, inst, regs);
+                } else {
+                    panic!("Should not see a Fallthrough here");
+                }
+            }
             Opcode::Trap => {}
             _ => unreachable!(),
+        }
+    }
+
+    fn move_ebb_arguments(&mut self, target: Ebb, inst: Inst, regs: &mut Regs) {
+        let arginfo: Vec<_> = self
+            .cur
+            .func
+            .dfg
+            .ebb_params(target)
+            .iter()
+            .zip(self.cur.func.dfg.inst_args(inst).iter())
+            .map(|(a, b)| (*b, *a))
+            .enumerate()
+            .collect();
+
+        for (k, (arg, target_arg)) in arginfo {
+            let temp = self.cur.ins().fill(arg);
+            let dest = self.cur.ins().spill(temp);
+            let spill = self.cur.built_inst();
+            let enc = self.cur.func.encodings[spill];
+            let constraints = self.encinfo.operand_constraints(enc).unwrap();
+            let rc = constraints.ins[0].regclass;
+            let reg = regs.take(rc).unwrap();
+            self.cur.func.locations[temp] = ValueLoc::Reg(reg);
+            self.cur.func.dfg.inst_args_mut(inst)[k] = dest;
+            regs.free(rc, reg);
+            self.cur.func.locations[dest] = self.cur.func.locations[target_arg];
         }
     }
 
@@ -638,43 +636,19 @@ impl<'a> Context<'a> {
         (from_stack, last)
     }
 
-    // Returns (Option<(target_ebb, side_exit)>, has_argument)
-    fn classify_branch(&self, inst: Inst, opcode: Opcode) -> (Option<(Ebb, bool)>, bool) {
+    fn branch_target(&self, inst: Inst) -> Ebb {
         match self.cur.func.dfg[inst] {
-            InstructionData::IndirectJump { .. } => {
-                debug_assert!(opcode == Opcode::IndirectJumpTableBr);
-                (None, true)
-            }
-            InstructionData::Jump { destination, .. } => {
-                // There should be no Opcode::Fallthrough nodes at this stage.
-                debug_assert!(opcode == Opcode::Jump);
-                (Some((destination, false)), false)
-            }
-            InstructionData::Branch { destination, .. } => {
-                debug_assert!(opcode == Opcode::Brz || opcode == Opcode::Brnz);
-                (Some((destination, true)), true)
-            }
-            InstructionData::BranchIcmp { destination, .. } => {
-                debug_assert!(opcode == Opcode::BrIcmp);
-                (Some((destination, true)), true)
-            }
-            InstructionData::BranchInt { destination, .. } => {
-                debug_assert!(opcode == Opcode::Brif);
-                (Some((destination, true)), true)
-            }
-            InstructionData::BranchFloat { destination, .. } => {
-                debug_assert!(opcode == Opcode::Brff);
-                (Some((destination, true)), true)
-            }
-            _ => {
-                panic!("Unexpected instruction in classify_branch");
-            }
+            InstructionData::Branch { destination, .. } => destination,
+            InstructionData::BranchIcmp { destination, .. } => destination,
+            InstructionData::BranchInt { destination, .. } => destination,
+            InstructionData::BranchFloat { destination, .. } => destination, 
+            _ => panic!("Unexpected instruction in classify_branch")
         }
     }
 
     // Make `inst`, which must be a side exit branch with operation `opcode`, jump to `new_ebb`
     // without any arguments.
-    fn rewrite_side_exit(&mut self, inst: Inst, opcode: Opcode, new_ebb: Ebb) {
+    fn rewrite_branch(&mut self, inst: Inst, opcode: Opcode, new_ebb: Ebb) {
         match opcode {
             Opcode::Brz => {
                 let val = self.cur.func.dfg.inst_args(inst)[0];
