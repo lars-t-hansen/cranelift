@@ -271,7 +271,7 @@ impl Context {
 
         branch_splitting::run(isa, func, cfg, domtree, &mut self.topo);
 
-        self.minimal.run(isa, func, cfg, domtree, &mut self.topo);
+        self.minimal.run(isa, func, domtree, &mut self.topo);
 
         if isa.flags().enable_verifier() {
             let ok = verify_context(func, cfg, domtree, isa, &mut errors).is_ok();

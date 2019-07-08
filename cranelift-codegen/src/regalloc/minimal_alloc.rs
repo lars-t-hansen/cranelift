@@ -13,10 +13,10 @@
 //! simplest register allocator imaginable for our given IR structure.
 //!
 //! The allocator requires that conditional branch exits that pass parameters have been split, ie,
-//! that the branch parameters have been removed by brancing to an intermediary block that performs
-//! a jump with the parameters.
+//! that the branch parameters have been removed by branching without parameters to an intermediary
+//! block that performs a jump with the parameters.
 
-// TODO: Can the flags hack be generalized?  The normal regalloc does not need this test.
+// TODO: Can the flags hack be generalized?  The coloring regalloc does not need this test.
 //       The isa has a uses_cpu_flags() thing that might be a useful guard?  Only postopt.rs
 //         uses this to guard flags-specific optimizations.
 //       There's the clobbers_flags on the RecipeConstraints, probably not what we want.
@@ -28,7 +28,9 @@
 //         "just so", eg in terms of the live value tracker
 //       => Could it be that the ValueLoc is already assigned in all cases for ValueLoc::Reg?
 //          But then what is the Reg?
+//
 // TODO: Feels like there are a few too many special-purpose tests and cases?
+//
 // TODO: The register set abstraction is probably quite slow, since it creates an iterator
 //       for pretty much every allocation; there are better ways.
 
@@ -36,7 +38,6 @@ use std::vec::Vec;
 
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
-use crate::flowgraph::ControlFlowGraph;
 use crate::ir::{
     AbiParam, ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode,
     StackSlotKind, Type, Value, ValueLoc,
@@ -63,18 +64,15 @@ impl Minimal {
         &mut self,
         isa: &TargetIsa,
         func: &mut Function,
-        cfg: &mut ControlFlowGraph,
         domtree: &mut DominatorTree,
         topo: &mut TopoOrder,
     ) {
         let mut ctx = Context {
-            new_blocks: false,
             usable_regs: isa.allocatable_registers(func),
             cur: EncCursor::new(func, isa),
             encinfo: isa.encoding_info(),
             domtree,
             topo,
-            cfg,
         };
         ctx.run()
     }
@@ -108,9 +106,6 @@ impl Regs {
 }
 
 struct Context<'a> {
-    // True if new blocks were inserted.
-    new_blocks: bool,
-
     // Set of registers that the allocator can use.
     usable_regs: RegisterSet,
 
@@ -124,7 +119,6 @@ struct Context<'a> {
     // References to contextual data structures we need.
     domtree: &'a mut DominatorTree,
     topo: &'a mut TopoOrder,
-    cfg: &'a mut ControlFlowGraph,
 }
 
 impl<'a> Context<'a> {
@@ -146,16 +140,13 @@ impl<'a> Context<'a> {
         while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
             self.cur.goto_top(ebb);
             while let Some(inst) = self.cur.next_inst() {
+                // Resolving aliases seems necessary because the minimal alloc is not preceded by
+                // the liveness allocation pass that would otherwise take care of it.
+                self.cur.func.dfg.resolve_aliases_in_arguments(inst);
                 if !self.cur.func.dfg[inst].opcode().is_ghost() {
                     self.visit_inst(inst, &mut regs);
                 }
             }
-        }
-
-        // If blocks were added the cfg and domtree are inconsistent and must be recomputed.
-        if self.new_blocks {
-            self.cfg.compute(&self.cur.func);
-            self.domtree.compute(&self.cur.func, self.cfg);
         }
 
         dbg!(&self.cur.func);
