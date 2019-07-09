@@ -123,7 +123,7 @@ struct Context<'a> {
 
 impl<'a> Context<'a> {
     fn run(&mut self) {
-        dbg!(&self.cur.func);
+        //dbg!(&self.cur.func);
 
         // For the entry block, spill register parameters to the stack while retaining their names.
         self.visit_entry_block(self.cur.func.layout.entry_block().unwrap());
@@ -149,7 +149,7 @@ impl<'a> Context<'a> {
             }
         }
 
-        dbg!(&self.cur.func);
+        //dbg!(&self.cur.func);
     }
 
     fn visit_entry_block(&mut self, entry: Ebb) {
