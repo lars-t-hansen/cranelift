@@ -290,7 +290,34 @@ impl<'a> Context<'a> {
         }
     }
 
+    // Parallel assignment for unconditional control flow.
+    //
+    // If a source value uses the same stack slot as a target value (which can happen along a back
+    // edge), we must take care not to write a target slot that is needed subsequently as a source.
+    // In the limit, there can be a circularity, with target (x,y) and ebb arguments (y,x), say.
+    //
+    // (A detail: Since our implementation of COPY introduces an alias we can't disambiguate by the
+    // value names; we must instead disambiguate by the actual stack slots they reference.)
+    //
+    // In principle, we can solve this trivially by introducing temps for all the arguments.
+    // Better, but still simple, is to introduce temps only for stack slots that appear in both the
+    // source and target lists, without worrying further about copy order.  As an optimization we
+    // avoid a copy when the source and target slots are the same slot.
+
     fn move_ebb_arguments(&mut self, target: Ebb, inst: Inst, regs: &mut Regs) {
+        let target_slots: Vec<_> = self
+            .cur
+            .func
+            .dfg
+            .ebb_params(target)
+            .iter()
+            .map(|i| if let ValueLoc::Stack(ss) = self.cur.func.locations[*i] {
+                ss
+            } else {
+                unreachable!()
+            })
+            .collect();
+
         let arginfo: Vec<_> = self
             .cur
             .func
@@ -302,7 +329,38 @@ impl<'a> Context<'a> {
             .enumerate()
             .collect();
 
+        let mut updates = vec![];
         for (k, (arg, target_arg)) in arginfo {
+            let arg_loc = self.cur.func.locations[arg];
+            let target_arg_loc = self.cur.func.locations[target_arg];
+            if let (ValueLoc::Stack(arg_ss), ValueLoc::Stack(target_ss)) = (arg_loc, target_arg_loc) {
+                if arg_ss == target_ss {
+                    continue;
+                }
+                let mut need_stack_temp = false;
+                for ts in &target_slots {
+                    if arg_ss == *ts {
+                        need_stack_temp = true;
+                        break;
+                    }
+                }
+                if need_stack_temp {
+                    let (temp, rc, reg) = self.fill_temp_register(arg, regs);
+                    let the_temp = self.cur.ins().spill(temp);
+                    let value_type = self.cur.func.dfg.value_type(arg);
+                    let ss = self.cur.func.stack_slots.make_spill_slot(value_type);
+                    self.cur.func.locations[the_temp] = ValueLoc::Stack(ss);
+                    regs.free(rc, reg);
+                    updates.push((k, the_temp, target_arg));
+                } else {
+                    updates.push((k, arg, target_arg));
+                }
+            } else {
+                unreachable!();
+            }
+        }
+
+        for (k, arg, target_arg) in updates {
             let (temp, rc, reg) = self.fill_temp_register(arg, regs);
             let dest = self.cur.ins().spill(temp);
             self.cur.func.dfg.inst_args_mut(inst)[k] = dest;
