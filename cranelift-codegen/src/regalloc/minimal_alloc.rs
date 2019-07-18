@@ -299,10 +299,10 @@ impl<'a> Context<'a> {
     // (A detail: Since our implementation of COPY introduces an alias we can't disambiguate by the
     // value names; we must instead disambiguate by the actual stack slots they reference.)
     //
-    // In principle, we can solve this trivially by introducing temps for all the arguments.
-    // Better, but still simple, is to introduce temps only for stack slots that appear in both the
-    // source and target lists, without worrying further about copy order.  As an optimization we
-    // avoid a copy when the source and target slots are the same slot.
+    // We can solve this trivially by introducing temps for all the arguments: copy into temps, then
+    // copy into target slots.  Better, but still simple, is to introduce temps only for stack slots
+    // that appear in both the source and target lists, without worrying further about copy order.
+    // As a simple optimization we avoid a copy when the source and target slots are the same slot.
 
     fn move_ebb_arguments(&mut self, target: Ebb, inst: Inst, regs: &mut Regs) {
         let target_slots: Vec<_> = self
@@ -337,13 +337,7 @@ impl<'a> Context<'a> {
                 if arg_ss == target_ss {
                     continue;
                 }
-                let mut need_stack_temp = false;
-                for ts in &target_slots {
-                    if arg_ss == *ts {
-                        need_stack_temp = true;
-                        break;
-                    }
-                }
+                let need_stack_temp = target_slots.iter().any(|ts| arg_ss == *ts);
                 if need_stack_temp {
                     let (temp, rc, reg) = self.fill_temp_register(arg, regs);
                     let the_temp = self.cur.ins().spill(temp);
