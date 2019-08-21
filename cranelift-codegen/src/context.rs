@@ -240,8 +240,8 @@ impl Context {
 
     /// Move the introduction of some flow-independent values close to their uses.
     pub fn rematerialize(&mut self, isa: &TargetIsa) -> CodegenResult<()> {
-        do_rematerialize(isa, &mut self.func);
-        self.verify_if(isa)?;
+        // do_rematerialize(isa, &mut self.func);
+        // self.verify_if(isa)?;
         Ok(())
     }
 

@@ -11,8 +11,9 @@
 //! unreferenced as a result of rematerialization.  We really need to remove dead phi arguments as
 //! part of dce for this to be truly effective.
 
-// TODO: I see some fp constants are being lowered to load-integer-bits + move-to-fp-reg but this
-// should not be necessary?
+// TODO: I see some fp constants are being lowered to load-integer-bits + move-to-fp-reg, Dan
+// explained to me why this was necessary but I forget why.  (It may be that the latter form is the
+// legalized form.)  Anyhow, we must deal with this to rematerialize FP constants at all.
 //
 // TODO: Limitations on which values we accept?
 //
@@ -48,11 +49,29 @@ enum Const {
 
 pub fn do_rematerialize(isa: &TargetIsa, func: &mut Function) {
     let mut cur = EncCursor::new(func, isa);
+
+    // To get the postorder:
+    //
+    //   self.domtree.cfg_postorder().iter().rev().collect::<Vec<Ebb>>()
+    //
+    // and then we must have a map ebb -> flag where flag is tri-state: flags dead in all
+    // predecessors; flags set in all predecessors; flags set in some and dead in others.  the
+    // absence of an entry indicates the starting state.  Along any cti edge we update the
+    // value of the entry for the target ebb.
+    
     let ebbs = cur.func.layout.ebbs().collect::<Vec<Ebb>>();
 
     for ebb in ebbs {
         cur.goto_first_inst(ebb);
         let mut point = cur.current_inst().unwrap();
+
+        // FIXME: This assumption about flags being clobbered on entry to the block was possibly
+        // correct before but it is not correct with basic blocks.  We'll need to walk the ebbs in
+        // rpo order and propagate the flags_are_dead flag properly from successors to predecessors.
+        // Then the rematerialization point may be in a different block than the instruction
+        // consuming the rematerialized instructions.  I think this is probably not a problem for
+        // loops, but I'm not sure yet.
+
         let mut flags_are_dead = true;
 
         cur.goto_top(ebb);
