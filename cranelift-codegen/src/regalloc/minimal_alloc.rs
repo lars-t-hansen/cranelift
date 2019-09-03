@@ -209,27 +209,53 @@ impl<'a> Context<'a> {
 
     fn visit_inst(&mut self, inst: Inst, regs: &mut Regs) {
         let opcode = self.cur.func.dfg[inst].opcode();
-        if opcode == Opcode::Copy {
-            self.visit_copy(inst);
-        } else if opcode.is_terminator() {
-            self.visit_terminator(inst, regs, opcode);
-        } else if opcode.is_branch() {
-            self.visit_branch(inst, regs);
-        } else if opcode.is_call() {
-            self.visit_call(inst, regs, opcode);
-        } else if opcode == Opcode::Spill && self.is_spill_to_outgoing_arg(inst) {
-            self.visit_outgoing_arg_spill(inst, regs);
-        } else if opcode == Opcode::Spill || opcode == Opcode::Fill {
-            // Inserted by the register allocator; ignore them.
-        } else {
-            // Some opcodes should not be encountered here.
-            debug_assert!(
-                opcode != Opcode::Regmove
-                    && opcode != Opcode::Regfill
-                    && opcode != Opcode::Regspill
-                    && opcode != Opcode::CopySpecial
-            );
-            self.visit_plain_inst(inst, regs);
+        match opcode {
+            Opcode::Copy => {
+                self.visit_copy(inst);
+            }
+            Opcode::BrTable |
+            Opcode::Fallthrough |
+            Opcode::FallthroughReturn |
+            Opcode::IndirectJumpTableBr |
+            Opcode::Jump |
+            Opcode::Return |
+            Opcode::Trap => {
+                debug_assert!(opcode.is_terminator());
+                self.visit_terminator(inst, regs, opcode);
+            }
+            Opcode::BrIcmp |
+            Opcode::Brff |
+            Opcode::Brif |
+            Opcode::Brnz |
+            Opcode::Brz => {
+                debug_assert!(opcode.is_branch());
+                self.visit_branch(inst, regs);
+            }
+            Opcode::Call |
+            Opcode::CallIndirect => {
+                debug_assert!(opcode.is_call());
+                self.visit_call(inst, regs, opcode);
+            }
+            Opcode::Spill if self.is_spill_to_outgoing_arg(inst) => {
+                self.visit_outgoing_arg_spill(inst, regs);
+            }
+            Opcode::Spill | Opcode::Fill => {
+                // Inserted by the register allocator; ignore them.
+            }
+            _ => {
+                // Some opcodes should not be encountered here.
+                debug_assert!(
+                    opcode != Opcode::Regmove
+                        && opcode != Opcode::Regfill
+                        && opcode != Opcode::Regspill
+                        && opcode != Opcode::CopySpecial
+                );
+                // Make sure we covered all cases above.
+                debug_assert!(!opcode.is_terminator()
+                              && !opcode.is_branch()
+                              && !opcode.is_call());
+                self.visit_plain_inst(inst, regs);
+            }
         }
     }
 
