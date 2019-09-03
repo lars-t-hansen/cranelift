@@ -91,13 +91,17 @@ impl Regs {
         self.registers.take(rc, r);
     }
 
-    fn take(&mut self, rc: RegClass) -> Option<RegUnit> {
+    fn take(&mut self, rc: RegClass) -> RegUnit {
         let mut i = self.registers.iter(rc);
-        let r = i.next();
-        if r.is_some() {
-            self.registers.take(rc, r.unwrap());
+        match i.next() {
+            Some(r) => {
+                self.registers.take(rc, r);
+                r
+            }
+            None => {
+                panic!("No available register");
+            }
         }
-        r
     }
 
     fn free(&mut self, rc: RegClass, r: RegUnit) {
@@ -482,8 +486,8 @@ impl<'a> Context<'a> {
             let (reg, is_tied) = match constraint.kind {
                 ConstraintKind::FixedReg(r) => (r, false),
                 ConstraintKind::FixedTied(r) => (r, true),
-                ConstraintKind::Tied(_) => (regs.take(rc).unwrap(), true),
-                ConstraintKind::Reg => (regs.take(rc).unwrap(), false),
+                ConstraintKind::Tied(_) => (regs.take(rc), true),
+                ConstraintKind::Reg => (regs.take(rc), false),
                 ConstraintKind::Stack => unreachable!(),
             };
             reg_args.push((k, *arg, rc, reg, is_tied));
@@ -553,7 +557,7 @@ impl<'a> Context<'a> {
                     (hit.2, hit.3)
                 }
                 ConstraintKind::Reg => {
-                    (constraint.regclass, regs.take(constraint.regclass).unwrap())
+                    (constraint.regclass, regs.take(constraint.regclass))
                 }
                 ConstraintKind::Stack => unreachable!(),
             };
@@ -605,7 +609,7 @@ impl<'a> Context<'a> {
         let enc = self.cur.func.encodings[fill];
         let constraints = self.encinfo.operand_constraints(enc).unwrap();
         let rc = constraints.ins[0].regclass;
-        let reg = regs.take(rc).unwrap();
+        let reg = regs.take(rc);
         self.cur.func.locations[temp] = ValueLoc::Reg(reg);
         (temp, rc, reg)
     }
