@@ -14,6 +14,8 @@ use crate::regalloc::coalescing::Coalescing;
 use crate::regalloc::coloring::Coloring;
 use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::regalloc::liveness::Liveness;
+use crate::regalloc::lth_branch_splitting;
+use crate::regalloc::minimal_alloc::Minimal;
 use crate::regalloc::reload::Reload;
 use crate::regalloc::safepoint::emit_stackmaps;
 use crate::regalloc::spilling::Spilling;
@@ -35,6 +37,12 @@ pub struct Context {
     spilling: Spilling,
     reload: Reload,
     coloring: Coloring,
+    minimal: Minimal,
+}
+
+pub enum Mechanism {
+    Minimal,
+    Coloring,
 }
 
 impl Context {
@@ -52,6 +60,7 @@ impl Context {
             spilling: Spilling::new(),
             reload: Reload::new(),
             coloring: Coloring::new(),
+            minimal: Minimal::new(),
         }
     }
 
@@ -65,6 +74,7 @@ impl Context {
         self.spilling.clear();
         self.reload.clear();
         self.coloring.clear();
+        self.minimal.clear();
     }
 
     /// Current values liveness state.
@@ -82,10 +92,32 @@ impl Context {
         func: &mut Function,
         cfg: &mut ControlFlowGraph,
         domtree: &mut DominatorTree,
+        mechanism: Mechanism,
     ) -> CodegenResult<()> {
         let _tt = timing::regalloc();
         debug_assert!(domtree.is_valid());
 
+        let errors = match mechanism {
+            Mechanism::Minimal => self.minimal(isa, func, cfg, domtree)?,
+            Mechanism::Coloring => self.graph_coloring(isa, func, cfg, domtree)?,
+        };
+
+        // Even if we arrive here, (non-fatal) errors might have been reported, so we
+        // must make sure absolutely nothing is wrong
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.into())
+        }
+    }
+
+    fn graph_coloring(
+        &mut self,
+        isa: &TargetIsa,
+        func: &mut Function,
+        cfg: &mut ControlFlowGraph,
+        domtree: &mut DominatorTree,
+    ) -> CodegenResult<VerifierErrors> {
         let mut errors = VerifierErrors::default();
 
         // `Liveness` and `Coloring` are self-clearing.
@@ -96,17 +128,17 @@ impl Context {
         self.tracker.clear();
 
         // Pass: Split branches, add space where to add copy & regmove instructions.
+        // TODO: this is good for both allocators and should be lifted up.
         #[cfg(feature = "basic-blocks")]
         {
             branch_splitting::run(isa, func, cfg, domtree, &mut self.topo);
         }
 
-        // Pass: Liveness analysis.
+        // Pass: Liveness analysis
         self.liveness.compute(isa, func, cfg);
 
         if isa.flags().enable_verifier() {
             let ok = verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok();
-
             if !ok {
                 return Err(errors.into());
             }
@@ -234,12 +266,29 @@ impl Context {
             }
         }
 
-        // Even if we arrive here, (non-fatal) errors might have been reported, so we
-        // must make sure absolutely nothing is wrong
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.into())
+        Ok(errors)
+    }
+
+    fn minimal(
+        &mut self,
+        isa: &TargetIsa,
+        func: &mut Function,
+        cfg: &mut ControlFlowGraph,
+        domtree: &mut DominatorTree,
+    ) -> CodegenResult<VerifierErrors> {
+        let mut errors = VerifierErrors::default();
+
+        lth_branch_splitting::run(isa, func, cfg, domtree, &mut self.topo);
+
+        self.minimal.run(isa, func, domtree, &mut self.topo);
+
+        if isa.flags().enable_verifier() {
+            let ok = verify_context(func, cfg, domtree, isa, &mut errors).is_ok();
+            if !ok {
+                return Err(errors.into());
+            }
         }
+
+        Ok(errors)
     }
 }
