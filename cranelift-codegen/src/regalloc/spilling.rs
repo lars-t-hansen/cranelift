@@ -1,5 +1,7 @@
 //! Spilling pass.
 //!
+//! TODO: Update this comment.
+//!
 //! The spilling pass is the first to run after the liveness analysis. Its primary function is to
 //! ensure that the register pressure never exceeds the number of available registers by moving
 //! some SSA values to spill slots on the stack. This is encoded in the affinity of the value's
@@ -121,7 +123,8 @@ impl Spilling {
 
 impl<'a> Context<'a> {
     fn run(&mut self, tracker: &mut LiveValueTracker) {
-        self.topo.reset(self.cur.func.layout.ebbs());
+        // RPO is needed because spill info is flow-sensitive.
+        self.topo.reset(self.domtree.cfg_postorder().iter().rev().map(|x| *x));
         while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
             self.visit_ebb(ebb, tracker);
         }
@@ -199,33 +202,13 @@ impl<'a> Context<'a> {
         self.pressure.reset();
         self.take_live_regs(liveins);
 
-        // An EBB can have an arbitrary (up to 2^16...) number of parameters, so they are not
-        // guaranteed to fit in registers.
+        // Spilling should have been performed along the branches reaching this block (for non-entry
+        // blocks) or should not happen (for the entry block).  We just need to take registers for
+        // the parameters.
         for lv in params {
             if let Affinity::Reg(rci) = lv.affinity {
-                let rc = self.reginfo.rc(rci);
-                'try_take: while let Err(mask) = self.pressure.take_transient(rc) {
-                    debug!("Need {} reg for EBB param {}", rc, lv.value);
-                    match self.spill_candidate(mask, liveins) {
-                        Some(cand) => {
-                            debug!(
-                                "Spilling live-in {} to make room for {} EBB param {}",
-                                cand, rc, lv.value
-                            );
-                            self.spill_reg(cand);
-                        }
-                        None => {
-                            // We can't spill any of the live-in registers, so we have to spill an
-                            // EBB argument. Since the current spill metric would consider all the
-                            // EBB arguments equal, just spill the present register.
-                            debug!("Spilling {} EBB argument {}", rc, lv.value);
-
-                            // Since `spill_reg` will free a register, add the current one here.
-                            self.pressure.take(rc);
-                            self.spill_reg(lv.value);
-                            break 'try_take;
-                        }
-                    }
+                if let Err(_) = self.pressure.take_transient(self.reginfo.rc(rci)) {
+                    panic!("There should be no spilling here");
                 }
             }
         }
