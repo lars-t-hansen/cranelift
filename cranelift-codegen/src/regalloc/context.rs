@@ -113,7 +113,7 @@ impl Context {
 
     fn graph_coloring(
         &mut self,
-        isa: &TargetIsa,
+        isa: &dyn TargetIsa,
         func: &mut Function,
         cfg: &mut ControlFlowGraph,
         domtree: &mut DominatorTree,
@@ -271,7 +271,7 @@ impl Context {
 
     fn minimal(
         &mut self,
-        isa: &TargetIsa,
+        isa: &dyn TargetIsa,
         func: &mut Function,
         cfg: &mut ControlFlowGraph,
         domtree: &mut DominatorTree,

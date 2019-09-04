@@ -16,7 +16,7 @@ use crate::isa::TargetIsa;
 use crate::topo_order::TopoOrder;
 
 pub fn run(
-    isa: &TargetIsa,
+    isa: &dyn TargetIsa,
     func: &mut Function,
     cfg: &mut ControlFlowGraph,
     domtree: &mut DominatorTree,

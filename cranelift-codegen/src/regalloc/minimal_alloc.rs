@@ -62,7 +62,7 @@ impl Minimal {
     /// Run register allocation.
     pub fn run(
         &mut self,
-        isa: &TargetIsa,
+        isa: &dyn TargetIsa,
         func: &mut Function,
         domtree: &mut DominatorTree,
         topo: &mut TopoOrder,
