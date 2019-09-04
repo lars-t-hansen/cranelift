@@ -40,7 +40,7 @@ use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
 use crate::ir::{
     AbiParam, ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode,
-    StackSlotKind, Type, Value, ValueLoc,
+    StackSlot, StackSlotKind, Type, Value, ValueLoc,
 };
 use crate::isa::registers::{RegClass, RegUnit};
 use crate::isa::{ConstraintKind, EncInfo, TargetIsa};
@@ -73,6 +73,11 @@ impl Minimal {
             encinfo: isa.encoding_info(),
             domtree,
             topo,
+            // TODO: These vectors could be stored in Minimal also?
+            mea_target_slots: vec![],
+            mea_arginfo: vec![],
+            mea_updates: vec![],
+            fra_reg_args: vec![],
         };
         ctx.run()
     }
@@ -123,6 +128,14 @@ struct Context<'a> {
     // References to contextual data structures we need.
     domtree: &'a mut DominatorTree,
     topo: &'a mut TopoOrder,
+
+    // Cached vectors to reduce allocation in move_ebb_arguments
+    mea_target_slots: Vec<StackSlot>,
+    mea_arginfo: Vec<(usize, Value, Value)>,
+    mea_updates: Vec<(usize, Value, Value)>,
+
+    // Cached vectors to reduce allocation in fill_register_args (and spill_register_results).
+    fra_reg_args: Vec<(usize, Value, RegClass, RegUnit, bool)>,
 }
 
 impl<'a> Context<'a> {
@@ -335,39 +348,29 @@ impl<'a> Context<'a> {
     // As a simple optimization we avoid a copy when the source and target slots are the same slot.
 
     fn move_ebb_arguments(&mut self, target: Ebb, inst: Inst, regs: &mut Regs) {
-        let target_slots: Vec<_> = self
-            .cur
-            .func
-            .dfg
-            .ebb_params(target)
-            .iter()
-            .map(|i| if let ValueLoc::Stack(ss) = self.cur.func.locations[*i] {
-                ss
-            } else {
-                unreachable!()
-            })
-            .collect();
+        self.mea_target_slots.clear();
+        for p in self.cur.func.dfg.ebb_params(target) {
+            if let ValueLoc::Stack(ss) = self.cur.func.locations[*p] {
+                self.mea_target_slots.push(ss)
+            }
+        }
 
-        let arginfo: Vec<_> = self
-            .cur
-            .func
-            .dfg
-            .ebb_params(target)
-            .iter()
-            .zip(self.cur.func.dfg.inst_args(inst).iter())
-            .map(|(a, b)| (*b, *a))
-            .enumerate()
-            .collect();
+        self.mea_arginfo.clear();
+        for i in 0..self.cur.func.dfg.ebb_params(target).len() {
+            self.mea_arginfo.push((i, self.cur.func.dfg.inst_args(inst)[i],
+                                   self.cur.func.dfg.ebb_params(target)[i]));
+        }
 
-        let mut updates = vec![];
-        for (k, (arg, target_arg)) in arginfo {
+        self.mea_updates.clear();
+        for ai in 0..self.mea_arginfo.len() {
+            let (k, arg, target_arg) = self.mea_arginfo[ai];
             let arg_loc = self.cur.func.locations[arg];
             let target_arg_loc = self.cur.func.locations[target_arg];
             if let (ValueLoc::Stack(arg_ss), ValueLoc::Stack(target_ss)) = (arg_loc, target_arg_loc) {
                 if arg_ss == target_ss {
                     continue;
                 }
-                let need_stack_temp = target_slots.iter().any(|ts| arg_ss == *ts);
+                let need_stack_temp = self.mea_target_slots.iter().any(|ts| arg_ss == *ts);
                 if need_stack_temp {
                     let (temp, rc, reg) = self.fill_temp_register(arg, regs);
                     let the_temp = self.cur.ins().spill(temp);
@@ -375,16 +378,17 @@ impl<'a> Context<'a> {
                     let ss = self.cur.func.stack_slots.make_spill_slot(value_type);
                     self.cur.func.locations[the_temp] = ValueLoc::Stack(ss);
                     regs.free(rc, reg);
-                    updates.push((k, the_temp, target_arg));
+                    self.mea_updates.push((k, the_temp, target_arg));
                 } else {
-                    updates.push((k, arg, target_arg));
+                    self.mea_updates.push((k, arg, target_arg));
                 }
             } else {
                 unreachable!();
             }
         }
 
-        for (k, arg, target_arg) in updates {
+        for ui in 0..self.mea_updates.len() {
+            let (k, arg, target_arg) = self.mea_updates[ui];
             let (temp, rc, reg) = self.fill_temp_register(arg, regs);
             let dest = self.cur.ins().spill(temp);
             self.cur.func.dfg.inst_args_mut(inst)[k] = dest;
@@ -431,8 +435,8 @@ impl<'a> Context<'a> {
     }
 
     fn visit_plain_inst(&mut self, inst: Inst, regs: &mut Regs) {
-        let reg_args = self.fill_register_args(inst, regs, false);
-        self.spill_register_results(inst, regs, reg_args);
+        self.fill_register_args(inst, regs, false);
+        self.spill_register_results(inst, regs);
     }
 
     // This will not free any tied registers it allocates.  It leaves the point at `inst`.  The
@@ -442,8 +446,8 @@ impl<'a> Context<'a> {
         &mut self,
         inst: Inst,
         regs: &mut Regs,
-        fixed: bool,
-    ) -> Vec<(usize, Value, RegClass, RegUnit, bool)> {
+        fixed: bool
+    ) {
         let constraints = self
             .encinfo
             .operand_constraints(self.cur.func.encodings[inst]);
@@ -462,7 +466,7 @@ impl<'a> Context<'a> {
         }
 
         // Assign all input registers.
-        let mut reg_args = vec![];
+        self.fra_reg_args.clear();
         for (k, arg) in if fixed {
             self.cur.func.dfg.inst_fixed_args(inst)
         } else {
@@ -490,11 +494,11 @@ impl<'a> Context<'a> {
                 ConstraintKind::Reg => (regs.take(rc), false),
                 ConstraintKind::Stack => unreachable!(),
             };
-            reg_args.push((k, *arg, rc, reg, is_tied));
+            self.fra_reg_args.push((k, *arg, rc, reg, is_tied));
         }
 
         // Insert fills, assign locations, update the instruction, free registers.
-        for (k, arg, rc, reg, is_tied) in &reg_args {
+        for (k, arg, rc, reg, is_tied) in &self.fra_reg_args {
             let value_type = self.cur.func.dfg.value_type(*arg);
             if value_type.is_flags() {
                 self.cur.func.locations[*arg] = ValueLoc::Reg(*reg);
@@ -511,8 +515,6 @@ impl<'a> Context<'a> {
                 regs.free(*rc, *reg);
             }
         }
-
-        reg_args
     }
 
     // This will assume that tied registers are already allocated.  It leaves the point at the last
@@ -520,8 +522,7 @@ impl<'a> Context<'a> {
     fn spill_register_results(
         &mut self,
         inst: Inst,
-        regs: &mut Regs,
-        reg_args: Vec<(usize, Value, RegClass, RegUnit, bool)>,
+        regs: &mut Regs
     ) {
         let constraints = self
             .encinfo
@@ -548,7 +549,7 @@ impl<'a> Context<'a> {
                 ConstraintKind::FixedTied(r) => (constraint.regclass, r),
                 ConstraintKind::FixedReg(r) => (constraint.regclass, r),
                 ConstraintKind::Tied(input) => {
-                    let hit = *reg_args
+                    let hit = self.fra_reg_args
                         .iter()
                         .filter(|(input_k, ..)| *input_k == input as usize)
                         .next()
