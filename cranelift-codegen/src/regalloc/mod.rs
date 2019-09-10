@@ -15,7 +15,6 @@ mod coalescing;
 mod context;
 mod diversion;
 mod pressure;
-mod reload;
 mod safepoint;
 mod solver;
 mod spilling;

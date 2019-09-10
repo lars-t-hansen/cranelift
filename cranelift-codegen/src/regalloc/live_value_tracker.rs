@@ -163,7 +163,7 @@ impl LiveValueTracker {
     /// Returns `(liveins, args)` as a pair of slices. The first slice is the set of live-in values
     /// from the immediate dominator. The second slice is the set of `ebb` parameters.
     ///
-    /// Dead parameters with no uses are included in `args`. Call `drop_dead_args()` to remove them.
+    /// Dead parameters with no uses are included in `args`. Call `drop_dead_params()` to remove them.
     pub fn ebb_top(
         &mut self,
         ebb: Ebb,
@@ -222,7 +222,7 @@ impl LiveValueTracker {
                         "EBB parameter live range ends at wrong EBB header"
                     );
                     // Give this value a fake endpoint that is the first instruction in the EBB.
-                    // We expect it to be removed by calling `drop_dead_args()`.
+                    // We expect it to be removed by calling `drop_dead_params()`.
                     self.live
                         .push(value, layout.first_inst(ebb).expect("Empty EBB"), lr);
                 }

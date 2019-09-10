@@ -14,7 +14,6 @@ use crate::regalloc::coalescing::Coalescing;
 use crate::regalloc::coloring::Coloring;
 use crate::regalloc::live_value_tracker::LiveValueTracker;
 use crate::regalloc::liveness::Liveness;
-use crate::regalloc::reload::Reload;
 use crate::regalloc::safepoint::emit_stackmaps;
 use crate::regalloc::spilling::Spilling;
 use crate::regalloc::virtregs::VirtRegs;
@@ -33,7 +32,6 @@ pub struct Context {
     topo: TopoOrder,
     tracker: LiveValueTracker,
     spilling: Spilling,
-    reload: Reload,
     coloring: Coloring,
 }
 
@@ -50,7 +48,6 @@ impl Context {
             topo: TopoOrder::new(),
             tracker: LiveValueTracker::new(),
             spilling: Spilling::new(),
-            reload: Reload::new(),
             coloring: Coloring::new(),
         }
     }
@@ -63,7 +60,6 @@ impl Context {
         self.topo.clear();
         self.tracker.clear();
         self.spilling.clear();
-        self.reload.clear();
         self.coloring.clear();
     }
 
@@ -141,7 +137,7 @@ impl Context {
         }
 
         // Pass: Spilling.
-        self.spilling.run(
+        let liveness_invalidated = self.spilling.run(
             isa,
             func,
             domtree,
@@ -153,7 +149,7 @@ impl Context {
 
         if isa.flags().enable_verifier() {
             let ok = verify_context(func, cfg, domtree, isa, &mut errors).is_ok()
-                && verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok()
+                && (liveness_invalidated || verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok())
                 && verify_cssa(
                     func,
                     cfg,
@@ -169,31 +165,17 @@ impl Context {
             }
         }
 
-        // Pass: Reload.
-        self.reload.run(
-            isa,
-            func,
-            domtree,
-            &mut self.liveness,
-            &mut self.topo,
-            &mut self.tracker,
-        );
+        // Pass: Liveness analysis must be re-done if changes were made that invalidated the
+        // liveness information.
+        if liveness_invalidated {
+            self.liveness.compute(isa, func, cfg);
 
-        if isa.flags().enable_verifier() {
-            let ok = verify_context(func, cfg, domtree, isa, &mut errors).is_ok()
-                && verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok()
-                && verify_cssa(
-                    func,
-                    cfg,
-                    domtree,
-                    &self.liveness,
-                    &self.virtregs,
-                    &mut errors,
-                )
-                .is_ok();
+            if isa.flags().enable_verifier() {
+                let ok = verify_liveness(isa, func, cfg, &self.liveness, &mut errors).is_ok();
 
-            if !ok {
-                return Err(errors.into());
+                if !ok {
+                    return Err(errors.into());
+                }
             }
         }
 
