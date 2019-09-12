@@ -1,6 +1,6 @@
 //! Spilling pass.
 //!
-//! TODO: Update this comment.
+//! TODO/SPLITTER: Update this comment.
 //!
 //! The spilling pass is the first to run after the liveness analysis. Its primary function is to
 //! ensure that the register pressure never exceeds the number of available registers by moving
@@ -19,7 +19,8 @@
 
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
-use crate::ir::{ArgumentLoc, Ebb, Function, Inst, InstBuilder, SigRef, Value, ValueLoc};
+use crate::entity::{SecondaryMap, SparseMap, SparseMapValue};
+use crate::ir::{ArgumentLoc, Ebb, Function, Inst, InstBuilder, SigRef, StackSlot, Value, ValueLoc};
 use crate::isa::registers::{RegClass, RegClassIndex, RegClassMask, RegUnit};
 use crate::isa::{ConstraintKind, EncInfo, RecipeConstraints, RegInfo, TargetIsa};
 use crate::regalloc::affinity::Affinity;
@@ -42,6 +43,60 @@ fn toprc_containing_regunit(unit: RegUnit, reginfo: &RegInfo) -> RegClass {
         .expect("reg unit should be in a toprc")
 }
 
+/// The spill state of a single value at EBB entry, see EbbSpillState below.
+struct SpillState {
+    value: Value,
+    affinity: Affinity,         // only Stack or Reg(rci)
+}
+
+impl SparseMapValue<Value> for SpillState {
+    fn key(&self) -> Value {
+        self.value
+    }
+}
+
+type SpillStateMap = SparseMap<Value, SpillState>;
+
+/// Here we have info about the current incoming spill state of the EBB.  The structure is first
+/// created when we first encounter an EBB in the RPO walk, and then updated as we reach the ebb
+/// through other paths.  When we process the EBB, we apply the state herein before processing the
+/// instructions of the EBB.  We seed this map with info about the entry block.
+///
+/// The spill state includes both live-in names and parameter names.
+struct EbbSpillState {
+    key: Ebb,
+    ss: SpillStateMap,
+}
+
+impl SparseMapValue<Ebb> for EbbSpillState {
+    fn key(&self) -> Ebb {
+        self.key
+    }
+}
+
+type EbbSpillStateMap = SparseMap<Ebb, EbbSpillState>;
+
+/// The slot is always the result of the value having been spilled, but it is possible that the
+/// value is an incoming stack parameter, hence it's optional.
+///
+/// The rci is the rci initially assigned to the value:
+/// - if it's a result generated into a register then that provides the rci, and we
+///   set it here when the value is spilled.
+/// - if it's an incoming register parameter then that provides the rci
+/// - if it's an incoming stack parameter then we can compute the rci from the abi
+
+struct ValueAndLocations {
+    value: Value,
+    slot:  Option<StackSlot>,
+    rci:   Option<RegClassIndex>
+}
+
+impl SparseMapValue<Value> for ValueAndLocations {
+    fn key(&self) -> Value {
+        self.value
+    }
+}
+
 /// Persistent data structures for the spilling pass.
 pub struct Spilling {
     spills: Vec<Value>,
@@ -56,6 +111,7 @@ struct Context<'a> {
     // Cached ISA information.
     reginfo: RegInfo,
     encinfo: EncInfo,
+    isa: &'a dyn TargetIsa,
 
     // References to contextual data structures we need.
     domtree: &'a DominatorTree,
@@ -76,6 +132,12 @@ struct Context<'a> {
 
     // Set to true if new names were created in such a way that liveness analysis must be rerun.
     liveness_invalidated: bool,
+
+    // This is indexed by Value and is the same length as self.cur.func.locations, so when a new
+    // value is created we must extend it.
+    affinities: SecondaryMap<Value, Affinity>,
+
+    locations: SparseMap<Value, ValueAndLocations>,
 }
 
 impl Spilling {
@@ -108,10 +170,12 @@ impl Spilling {
         debug!("Spilling for:\n{}", func.display(isa));
         let reginfo = isa.register_info();
         let usable_regs = isa.allocatable_registers(func);
+
         let mut ctx = Context {
             cur: EncCursor::new(func, isa),
             reginfo: isa.register_info(),
             encinfo: isa.encoding_info(),
+            isa,
             domtree,
             liveness,
             virtregs,
@@ -119,28 +183,77 @@ impl Spilling {
             pressure: Pressure::new(&reginfo, &usable_regs),
             spills: &mut self.spills,
             reg_uses: &mut self.reg_uses,
-            liveness_invalidated: false
+            liveness_invalidated: false,
+            affinities: SecondaryMap::new(),
+            locations: SparseMap::new(),
         };
-        ctx.run(tracker);
+
+        let mut ebb_spill_state: EbbSpillStateMap = SparseMap::new();
+
+        ctx.run(&mut ebb_spill_state, tracker);
         ctx.liveness_invalidated
     }
 }
 
 impl<'a> Context<'a> {
-    fn run(&mut self, tracker: &mut LiveValueTracker) {
+    fn run(&mut self, ebb_spill_state: &mut EbbSpillStateMap, tracker: &mut LiveValueTracker) {
+
+        // Create the spill state for the entry block and create ValueAndLocation entries for the
+        // incoming parameters.
+        self.init_spill_state(ebb_spill_state, tracker);
+
         // RPO is needed because spill info is flow-sensitive.
         self.topo.reset(self.domtree.cfg_postorder().iter().rev().map(|x| *x));
         while let Some(ebb) = self.topo.next(&self.cur.func.layout, self.domtree) {
-            self.visit_ebb(ebb, tracker);
+            self.visit_ebb(ebb, ebb_spill_state, tracker);
         }
+
+        // TODO: Rectification pass
     }
 
-    fn visit_ebb(&mut self, ebb: Ebb, tracker: &mut LiveValueTracker) {
+    // Seed the spill state with information about the entry block.
+    fn init_spill_state(&mut self, ebb_spill_state: &mut EbbSpillStateMap, tracker: &mut LiveValueTracker) {
+        let entry = self.cur.func.layout.entry_block().unwrap();
+        self.cur.goto_top(entry);
+        let (liveins, params) = tracker.ebb_top(
+            entry,
+            &self.cur.func.dfg,
+            self.liveness,
+            &self.cur.func.layout,
+            self.domtree,
+        );
+
+        debug_assert_eq!(liveins.len(), 0);
+        debug_assert_eq!(self.cur.func.signature.params.len(), params.len());
+
+        let mut ss = SparseMap::new();
+        for (param_idx, param) in params.iter().enumerate() {
+            if !param.is_dead {
+                let abi = self.cur.func.signature.params[param_idx];
+                let affinity = Affinity::abi(&abi, self.isa);
+                ss.insert(SpillState { value: param.value,
+                                       affinity });
+                self.locations.insert(ValueAndLocations { value: param.value,
+                                                          slot: None,
+                                                          rci: Some(self.cur.isa.regclass_for_abi_type(abi.value_type).into()) });
+            }
+        };
+
+        ebb_spill_state.insert(EbbSpillState {
+            key: entry,
+            ss,
+        });
+    }
+
+    fn visit_ebb(&mut self, ebb: Ebb, ebb_spill_state: &mut EbbSpillStateMap, tracker: &mut LiveValueTracker) {
         debug!("Spilling {}:", ebb);
         self.cur.goto_top(ebb);
+
+        self.apply_spill_state(ebb, ebb_spill_state, tracker);
+
         self.visit_ebb_header(ebb, tracker);
         tracker.drop_dead_params();
-        self.process_spills(tracker);
+        self.process_spills();
 
         while let Some(inst) = self.cur.next_inst() {
             if !self.cur.func.dfg[inst].opcode().is_ghost() {
@@ -150,8 +263,27 @@ impl<'a> Context<'a> {
                 self.free_regs(kills);
             }
             tracker.drop_dead(inst);
-            self.process_spills(tracker);
+            self.process_spills();
         }
+    }
+
+    fn apply_spill_state(&mut self, ebb: Ebb, ebb_spill_state: &mut EbbSpillStateMap, tracker: &mut LiveValueTracker) {
+        // TODO: In debug builds, set all affinities to Unassigned before applying the state.
+        let ss = &ebb_spill_state.get(ebb).unwrap().ss;
+        for lv in tracker.live() {
+            let affinity = ss.get(lv.value).unwrap().affinity;
+            self.set_affinity(lv.value, affinity);
+        }
+    }
+
+    // These abstract away whether we're using a map or an array indexed by value, and what's in the
+    // array, and where it might live.
+    fn affinity(&self, v: Value) -> Affinity {
+        self.affinities[v]
+    }
+
+    fn set_affinity(&mut self, v: Value, affinity: Affinity) {
+        self.affinities[v] = affinity;
     }
 
     // Take all live registers in `regs` from the pressure set.
@@ -159,7 +291,7 @@ impl<'a> Context<'a> {
     fn take_live_regs(&mut self, regs: &[LiveValue]) {
         for lv in regs {
             if !lv.is_dead {
-                if let Affinity::Reg(rci) = lv.affinity {
+                if let Affinity::Reg(rci) = self.affinity(lv.value) {
                     let rc = self.reginfo.rc(rci);
                     self.pressure.take(rc);
                 }
@@ -170,7 +302,7 @@ impl<'a> Context<'a> {
     // Free all registers in `kills` from the pressure set.
     fn free_regs(&mut self, kills: &[LiveValue]) {
         for lv in kills {
-            if let Affinity::Reg(rci) = lv.affinity {
+            if let Affinity::Reg(rci) = self.affinity(lv.value) {
                 if !self.spills.contains(&lv.value) {
                     let rc = self.reginfo.rc(rci);
                     self.pressure.free(rc);
@@ -183,7 +315,7 @@ impl<'a> Context<'a> {
     fn free_dead_regs(&mut self, regs: &[LiveValue]) {
         for lv in regs {
             if lv.is_dead {
-                if let Affinity::Reg(rci) = lv.affinity {
+                if let Affinity::Reg(rci) = self.affinity(lv.value) {
                     if !self.spills.contains(&lv.value) {
                         let rc = self.reginfo.rc(rci);
                         self.pressure.free(rc);
@@ -211,7 +343,7 @@ impl<'a> Context<'a> {
         // blocks) or should not happen (for the entry block).  We just need to take registers for
         // the parameters.
         for lv in params {
-            if let Affinity::Reg(rci) = lv.affinity {
+            if let Affinity::Reg(rci) = self.affinity(lv.value) {
                 if let Err(_) = self.pressure.take_transient(self.reginfo.rc(rci)) {
                     panic!("There should be no spilling here");
                 }
@@ -257,7 +389,7 @@ impl<'a> Context<'a> {
         // TODO: Be more sophisticated.
         if call_sig.is_some() {
             for lv in throughs {
-                if lv.affinity.is_reg() && !self.spills.contains(&lv.value) {
+                if self.affinity(lv.value).is_reg() && !self.spills.contains(&lv.value) {
                     self.spill_reg(lv.value);
                 }
             }
@@ -290,6 +422,9 @@ impl<'a> Context<'a> {
         // Exclude dead defs. Includes call return values.
         // This won't cause spilling.
         self.take_live_regs(defs);
+
+        // TODO: if the instruction is a branch or jump, update the state at the target EBB.
+        // Do that here or elsewhere?
     }
 
     // Collect register uses that are noteworthy in one of the following ways:
@@ -321,7 +456,8 @@ impl<'a> Context<'a> {
                     }
                     ConstraintKind::Reg => {}
                 }
-                if lr.affinity.is_stack() {
+
+                if self.affinity(arg).is_stack() {
                     reguse.spilled = true;
                 }
 
@@ -381,7 +517,7 @@ impl<'a> Context<'a> {
             .enumerate()
         {
             if abi.location.is_reg() {
-                let (rci, spilled) = match self.liveness[arg].affinity {
+                let (rci, spilled) = match self.affinity(arg) {
                     Affinity::Reg(rci) => (rci, false),
                     Affinity::Stack => (
                         self.cur.isa.regclass_for_abi_type(abi.value_type).into(),
@@ -408,6 +544,44 @@ impl<'a> Context<'a> {
         // secondary `opidx` key makes it possible to use an unstable (non-allocating) sort.
         self.reg_uses.sort_unstable_by_key(|u| (u.value, u.opidx));
 
+        // For branches, we probably care about non-fixed-args uses first, since they must be
+        // in registers, and then the variable args second, since they must be either as they are
+        // or must conform to the target.  For branches, var args will not be tied or fixed, and so
+        // a copy will not be needed (cssa may have inserted one).  Or, we care about the varargs
+        // first since they may have a predetermined location, and the fixed args second, since
+        // they can be placed in other registers.
+        //
+        // In some sense, then:
+        //   - if first time through the target
+        //       - we keep the var registers + target live-ins we have and flag them as nonspillable, no code is
+        //         generated; what's spilled is flagged as spilled, ditto; we take regs for
+        //         these
+        //       - we then ensure that any nonvar values we have are filled and then take regs
+        //         for all these values
+        //   - else
+        //       - any var registers + target live-ins we have that need to be in registers are flagged as
+        //         nonspillable
+        //       - any var registers + ditto we have that need to be spilled are spilled
+        //       - any var registers + ditto we have that need to be filled are filled (and these regs
+        //         are nonspillable)
+        //       - we then ensure that any nonvar values we have are filled and then take regs
+        //         for all these values
+        //
+        // We should not run out of registers for any of this, ie, all spills are explicit, by policy,
+        // not by capacity.  If a capacity spill is necessary then we need a do-over: we need to allocate
+        // a block w/o params which jumps w/ params to the target, then the branch branches to the new
+        // block w/o params.  We should only do this for branches that take register args, otherwise
+        // we should panic.
+        //
+        // -- 
+        //
+        // reg_uses are sorted, which is also wrong for branches.  but also note they may come in in
+        // reverse order, because they're pushed onto a vector by collect_reg_uses.
+        //
+        // several branch instrs have multiple non-flag non-var register arguments.  eg, br_icmp has
+        // two; br_table, brz, brnz all have one.
+        // 
+
         self.cur.use_srcloc(inst);
         for i in 0..self.reg_uses.len() {
             let ru = self.reg_uses[i];
@@ -425,13 +599,59 @@ impl<'a> Context<'a> {
                 false
             };
 
+            // TODO: Along a branch we must set up the ebb arguments just so.
+            //
+            // If we're the first branch to reach a destination (the spill state map has no entry
+            // for the target ebb) then we record the current affinities for the values that are
+            // live-in to that block and the ebb parameters along the edge in a spill state record
+            // for the ebb.  If a value is currently spilled its canonical location will be spilled;
+            // if it is in a register it will continue to be in a register.
+            //
+            // Otherwise, we may have to change the parameters here to conform to the state at the
+            // target block: If the target block has a spilled value but the value is in a register
+            // then we must spill it; if the target block requires a register value but it is
+            // spilled then we must fill it.  We can choose whether to do this only along the edge,
+            // or do it in-line and thus also affect the subsequent code in the ebb (soon to be bb,
+            // so only an unconditional jump at most).
+            //
+            // [Solved] There's a risk that conforming to a previous ebb can't happen, if that ebb
+            // decided to keep more values in registers than we have register for at the subsequent
+            // instruction.  This can happen if the original branch did not require any register
+            // values but the new branch does, leaving less space for values live-in to the target.
+            // However, it is only an issue with a real register, not a flags register, so I'm not
+            // sure how much of an issue it really is...  Table branches?  And if it's a problem it
+            // can be fixed by introducing an intermediate block: we branch conditionally w/o
+            // parameters to another block, and jump unconditional from that one with the necessary
+            // parameters in the correct place.
+            //
+            // Also, there's the possibility that we won't be able to make the correct spilling
+            // decision yet because we don't yet have the necessary liveness information for the
+            // target in terms of value names?  We have the parameters... but the liveins?  We get
+            // those from the target's immediate dominator, which *could* be this one ... the
+            // algorithm in ebb_top in the tracker can be adapted to compute the target's liveins
+            // for us.
+
             if need_copy {
                 let copy = self.insert_copy(ru.value, ru.rci);
                 self.cur.func.dfg.inst_args_mut(inst)[ru.opidx as usize] = copy;
             }
 
+            // TODO: Remove this comment
+            //
+            // TODO: Probably this loop is changed: we'll have one case for non-branch and another
+            // case for branch, as they'll be pretty different.
+
+
+            // TODO: This is different.  Here we must make the branch variable arguments
+            // conform to the target's expectations (if it has any) or record them as the
+            // expectations (if not).
+            //
+            // The branch fixed arguments must be handled as normal values but can't cause anything
+            // to be spilled that has been set up for the target.
+            
             // Even if we don't insert a copy, we may need to account for register pressure for the
             // reload pass.
+
             if need_copy || ru.spilled {
                 let rc = self.reginfo.rc(ru.rci);
                 while let Err(mask) = self.pressure.take_transient(rc) {
@@ -463,6 +683,12 @@ impl<'a> Context<'a> {
                     }
                 }
             }
+            
+            if ru.spilled {
+                let fill = self.cur.ins().fill(ru.value);
+                let rci = self.locations.get(ru.value).unwrap().rci.unwrap();
+                self.set_affinity(fill, Affinity::Reg(rci));
+            }
         }
         self.pressure.reset_transient();
         self.reg_uses.clear()
@@ -486,7 +712,7 @@ impl<'a> Context<'a> {
             .filter_map(|lv| {
                 // Viable candidates are registers in one of the `mask` classes, and not already in
                 // the spill set.
-                if let Affinity::Reg(rci) = lv.affinity {
+                if let Affinity::Reg(rci) = self.affinity(lv.value) {
                     let rc = self.reginfo.rc(rci);
                     if (mask & (1 << rc.toprc)) != 0 && !self.spills.contains(&lv.value) {
                         // Here, `lv` is a viable spill candidate.
@@ -514,27 +740,39 @@ impl<'a> Context<'a> {
     /// Note that this does not update the cached affinity in the live value tracker. Call
     /// `process_spills` to do that.
     fn spill_reg(&mut self, value: Value) {
-        if let Affinity::Reg(rci) = self.liveness.spill(value) {
-            let rc = self.reginfo.rc(rci);
-            self.pressure.free(rc);
-            self.spills.push(value);
-            debug!("Spilled {}:{} -> {}", value, rc, self.pressure);
-        } else {
-            panic!("Cannot spill {} that was already on the stack", value);
-        }
+        let rci = match self.affinity(value) {
+            Affinity::Reg(rci) => rci,
+            _ => { panic!("Cannot spill {} that was already on the stack", value); }
+        };
 
-        // Assign a spill slot for the whole virtual register.
-        let ss = self
-            .cur
-            .func
-            .stack_slots
-            .make_spill_slot(self.cur.func.dfg.value_type(value));
-        for &v in self.virtregs.congruence_class(&value) {
-            self.liveness.spill(v);
-            self.cur.func.locations[v] = ValueLoc::Stack(ss);
-        }
+        let rc = self.reginfo.rc(rci);
+        self.pressure.free(rc);
+
+        // Remember that the value was spilled
+        self.spills.push(value);
+
+        // Create a spill instruction with the appropriate slot for the spilled value, and set the
+        // affinity for the spilled value.
+        let spill = self.cur.ins().copy(value);
+        let slot = self.get_spill_slot(value, rci);
+        self.set_affinity(spill, Affinity::Stack);
     }
 
+    fn get_spill_slot(&mut self, value: Value, rci: RegClassIndex) -> StackSlot {
+        match self.locations.get(value) {
+            Some(ValueAndLocations { slot: Some(slot), .. }) => *slot,
+            _ => {
+                let slot = self
+                    .cur
+                    .func
+                    .stack_slots
+                    .make_spill_slot(self.cur.func.dfg.value_type(value));
+                self.locations.insert(ValueAndLocations { value, slot: Some(slot), rci: Some(rci) });
+                slot
+            }
+        }
+    }
+    
     /// Process any pending spills in the `self.spills` vector.
     ///
     /// It is assumed that spills are removed from the pressure tracker immediately, see
@@ -542,11 +780,8 @@ impl<'a> Context<'a> {
     ///
     /// We also need to update the live range affinity and remove spilled values from the live
     /// value tracker.
-    fn process_spills(&mut self, tracker: &mut LiveValueTracker) {
-        if !self.spills.is_empty() {
-            tracker.process_spills(|v| self.spills.contains(&v));
-            self.spills.clear()
-        }
+    fn process_spills(&mut self) {
+        self.spills.clear()
     }
 
     /// Insert a `copy value` before the current instruction and give it a live range extending to
@@ -565,6 +800,9 @@ impl<'a> Context<'a> {
             self.cur.current_inst().expect("must be at an instruction"),
             &self.cur.func.layout,
         );
+
+        // New value starts out in a register
+        self.set_affinity(copy, Affinity::Reg(rci));
 
         copy
     }
