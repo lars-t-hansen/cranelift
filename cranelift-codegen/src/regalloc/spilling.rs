@@ -20,14 +20,14 @@
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
 use crate::entity::{SecondaryMap, SparseMap, SparseMapValue};
-use crate::ir::{ArgumentLoc, Ebb, Function, Inst, InstBuilder, SigRef, StackSlot, Value, ValueLoc};
+use crate::ir::{ArgumentLoc, Ebb, Function, Inst, InstBuilder, SigRef, StackSlot, Value};
 use crate::isa::registers::{RegClass, RegClassIndex, RegClassMask, RegUnit};
 use crate::isa::{ConstraintKind, EncInfo, RecipeConstraints, RegInfo, TargetIsa};
 use crate::regalloc::affinity::Affinity;
 use crate::regalloc::live_value_tracker::{LiveValue, LiveValueTracker};
 use crate::regalloc::liveness::Liveness;
 use crate::regalloc::pressure::Pressure;
-use crate::regalloc::virtregs::VirtRegs;
+use crate::regalloc::virtregs::{VirtReg,VirtRegs};
 use crate::timing;
 use crate::topo_order::TopoOrder;
 use core::fmt;
@@ -86,12 +86,23 @@ type EbbSpillStateMap = SparseMap<Ebb, EbbSpillState>;
 /// - if it's an incoming stack parameter then we can compute the rci from the abi
 
 struct ValueAndLocations {
-    value: Value,
+    value: VirtReg,
     slot:  Option<StackSlot>,
     rci:   Option<RegClassIndex>
 }
 
-impl SparseMapValue<Value> for ValueAndLocations {
+impl SparseMapValue<VirtReg> for ValueAndLocations {
+    fn key(&self) -> VirtReg {
+        self.value
+    }
+}
+
+struct ValueRepr {
+    value: Value,
+    repr: Value
+}
+
+impl SparseMapValue<Value> for ValueRepr {
     fn key(&self) -> Value {
         self.value
     }
@@ -116,7 +127,7 @@ struct Context<'a> {
     // References to contextual data structures we need.
     domtree: &'a DominatorTree,
     liveness: &'a mut Liveness,
-    virtregs: &'a VirtRegs,
+    virtregs: &'a mut VirtRegs,
     topo: &'a mut TopoOrder,
 
     // Current register pressure.
@@ -133,11 +144,19 @@ struct Context<'a> {
     // Set to true if new names were created in such a way that liveness analysis must be rerun.
     liveness_invalidated: bool,
 
-    // This is indexed by Value and is the same length as self.cur.func.locations, so when a new
-    // value is created we must extend it.
+    // Storage used during pass1 (currently).
     affinities: SecondaryMap<Value, Affinity>,
 
-    locations: SparseMap<Value, ValueAndLocations>,
+    // For each representative value, map the VR of that value to information about storage
+    // locations used for the value (register class index and stack slot), in its various
+    // manifestations.
+    //
+    // (Non-representative values do not have VRs and cannot appear here.)
+    locations: SparseMap<VirtReg, ValueAndLocations>,
+
+    // For each value introduced by a fill or a spill, map that value to the representative value:
+    // the program value whose live range was split.  For program values, this has no entry.
+    representative: SparseMap<Value, ValueRepr>,
 }
 
 impl Spilling {
@@ -162,7 +181,7 @@ impl Spilling {
         func: &mut Function,
         domtree: &DominatorTree,
         liveness: &mut Liveness,
-        virtregs: &VirtRegs,
+        virtregs: &mut VirtRegs,
         topo: &mut TopoOrder,
         tracker: &mut LiveValueTracker,
     ) -> bool {
@@ -186,6 +205,7 @@ impl Spilling {
             liveness_invalidated: false,
             affinities: SecondaryMap::new(),
             locations: SparseMap::new(),
+            representative: SparseMap::new(),
         };
 
         let mut ebb_spill_state: EbbSpillStateMap = SparseMap::new();
@@ -233,7 +253,7 @@ impl<'a> Context<'a> {
                 let affinity = Affinity::abi(&abi, self.isa);
                 ss.insert(SpillState { value: param.value,
                                        affinity });
-                self.locations.insert(ValueAndLocations { value: param.value,
+                self.locations.insert(ValueAndLocations { value: self.virtregs.get(param.value).unwrap(),
                                                           slot: None,
                                                           rci: Some(self.cur.isa.regclass_for_abi_type(abi.value_type).into()) });
             }
@@ -257,7 +277,7 @@ impl<'a> Context<'a> {
 
         while let Some(inst) = self.cur.next_inst() {
             if !self.cur.func.dfg[inst].opcode().is_ghost() {
-                self.visit_inst(inst, ebb, tracker);
+                self.visit_inst(inst, ebb, ebb_spill_state, tracker);
             } else {
                 let (_throughs, kills) = tracker.process_ghost(inst);
                 self.free_regs(kills);
@@ -355,7 +375,7 @@ impl<'a> Context<'a> {
         self.free_dead_regs(params);
     }
 
-    fn visit_inst(&mut self, inst: Inst, ebb: Ebb, tracker: &mut LiveValueTracker) {
+    fn visit_inst(&mut self, inst: Inst, ebb: Ebb, ebb_spill_state: &mut EbbSpillStateMap, tracker: &mut LiveValueTracker) {
         debug!("Inst {}, {}", self.cur.display_inst(inst), self.pressure);
         debug_assert_eq!(self.cur.current_inst(), Some(inst));
         debug_assert_eq!(self.cur.current_ebb(), Some(ebb));
@@ -375,7 +395,7 @@ impl<'a> Context<'a> {
         }
 
         if !self.reg_uses.is_empty() {
-            self.process_reg_uses(inst, tracker);
+            self.process_reg_uses(inst, ebb_spill_state, tracker);
         }
 
         // Update the live value tracker with this instruction.
@@ -422,9 +442,6 @@ impl<'a> Context<'a> {
         // Exclude dead defs. Includes call return values.
         // This won't cause spilling.
         self.take_live_regs(defs);
-
-        // TODO: if the instruction is a branch or jump, update the state at the target EBB.
-        // Do that here or elsewhere?
     }
 
     // Collect register uses that are noteworthy in one of the following ways:
@@ -539,48 +556,147 @@ impl<'a> Context<'a> {
     // Trigger spilling if any of the temporaries cause the register pressure to become too high.
     //
     // Leave `self.reg_uses` empty.
-    fn process_reg_uses(&mut self, inst: Inst, tracker: &LiveValueTracker) {
+
+    // TODO: Along a branch we must set up the ebb arguments just so.
+    //
+    // If we're the first branch to reach a destination (the spill state map has no entry
+    // for the target ebb) then we record the current affinities for the values that are
+    // live-in to that block and the ebb parameters along the edge in a spill state record
+    // for the ebb.  If a value is currently spilled its canonical location will be spilled;
+    // if it is in a register it will continue to be in a register.
+    //
+    // Otherwise, we may have to change the parameters here to conform to the state at the
+    // target block: If the target block has a spilled value but the value is in a register
+    // then we must spill it; if the target block requires a register value but it is
+    // spilled then we must fill it.  We can choose whether to do this only along the edge,
+    // or do it in-line and thus also affect the subsequent code in the ebb (soon to be bb,
+    // so only an unconditional jump at most).
+    //
+    // [Solved] There's a risk that conforming to a previous ebb can't happen, if that ebb
+    // decided to keep more values in registers than we have register for at the subsequent
+    // instruction.  This can happen if the original branch did not require any register
+    // values but the new branch does, leaving less space for values live-in to the target.
+    // However, it is only an issue with a real register, not a flags register, so I'm not
+    // sure how much of an issue it really is...  Table branches?  And if it's a problem it
+    // can be fixed by introducing an intermediate block: we branch conditionally w/o
+    // parameters to another block, and jump unconditional from that one with the necessary
+    // parameters in the correct place.
+    //
+    // Several branch instrs have multiple non-flag non-var register arguments.  eg, br_icmp has
+    // two; br_table, brz, brnz all have one.
+    // 
+    // Also, there's the possibility that we won't be able to make the correct spilling
+    // decision yet because we don't yet have the necessary liveness information for the
+    // target in terms of value names?  We have the parameters... but the liveins?  We get
+    // those from the target's immediate dominator, which *could* be this one ... the
+    // algorithm in ebb_top in the tracker can be adapted to compute the target's liveins
+    // for us.
+    //
+    // ---
+    //
+    // For branches, we care about the varargs first since they may have a predetermined
+    // location, and the fixed args second, since they can be placed in other registers.
+    //
+    // In some sense, then:
+    //   - if first time through the target
+    //       - we keep the var registers + target live-ins we have and flag them as nonspillable, no code is
+    //         generated; what's spilled is flagged as spilled, ditto; we take regs for
+    //         these
+    //       - but importantly we *can* allow spilling of ebb args here, and we must, since there can be
+    //         more ebb args than registers, and the ebb args might fill up the space for nonvar values,
+    //         so we may have to account (somehow) for the nonvar pressure first in this case.
+    //       - we then ensure that any nonvar values we have are filled and then take regs
+    //         for all these values
+    //   - else
+    //       - any var registers + target live-ins we have that need to be in registers are flagged as
+    //         nonspillable
+    //       - any var registers + ditto we have that need to be spilled are spilled
+    //       - any var registers + ditto we have that need to be filled are filled (and these regs
+    //         are nonspillable)
+    //       - we then ensure that any nonvar values we have are filled and then take regs
+    //         for all these values
+    //
+    // We should not run out of registers for any of this, ie, all spills are explicit, by policy,
+    // not by capacity.  If a capacity spill is necessary then we need a do-over: we need to allocate
+    // a block w/o params which jumps w/ params to the target, then the branch branches to the new
+    // block w/o params.  We should only do this for branches that take register args, otherwise
+    // we should panic.
+    //
+    // Note that none of the EBB parameters will be among the reg_uses; only the fixed params of
+    // a branch has been processed.  (Below, only the fixed params are excluded from being
+    // spilled in the original code.)
+    //
+    // This all suggests that we first do a loop (conditionally) to handle any branch args, and
+    // exclude values thus found from further spilling.  Then we do the fixed args, which we
+    // handle with the existing logic, except that the candidate set is a little more complex.
+    //
+
+    fn process_reg_uses(&mut self, inst: Inst, ebb_spill_state: &mut EbbSpillStateMap, tracker: &LiveValueTracker) {
+
+        // TODO: Note this could be multiple targets for table-jump but they all have no ebb params
+        // and the same live-ins.  The problem is that *some* of the blocks may have been reached
+        // from elsewhere before.  The ACTUAL problem is that those blocks may not be in sync wrt to
+        // their live-in locations.  In that case, fixup blocks must be inserted along the paths
+        // that violate the prior assumptions.
+
+        // If is_branch, then either target_state==None and targets is Some(vec), or
+        // target_state=Some(..) and targets==None.  Otherwise (false,None,None).
+        let (is_branch, target_state, targets) = match self.cur.func.dfg[inst] {
+            InstructionData::Branch { destination, .. } |
+            InstructionData::BranchFloat { destination, .. } |
+            InstructionData::BranchIcmp { destination, .. } |
+            InstructionData::BranchInt { destination, .. } |
+            InstructionData::Jump { destination, .. } => {
+                match ebb_spill_state.get(destination) {
+                    Some(target_state) => (true, Some(vec![target_state]), None),
+                    None => (true, None, Some(vec![target_state]))
+                }
+            }
+            InstructionData::BranchTable { opcode, .. } |
+            InstructionData::BranchTableBase { opcode, .. } |
+            InstructionData::BranchTableEntry { opcode, .. } |
+            _ => {
+                debug_assert!(!self.cur.func.dfg[inst].opcode().is_branch());
+                (false, None, None)
+            }
+        };
+
+        // first_time_through means first time we reach the target block(s)
+        if is_branch && target_state.is_some() {
+            let target_state = if target_state.unwrap().len() > 1 {
+                // branch table, and at least one of the blocks has constraints
+                // may need to create uniform constraints
+                // may need to insert blocks so that uniform constraints can be set up
+                // the cheap fix is that if there's a conflict in constraints we just
+                //   insert unconstrained blocks for all of them and rewrite the
+                //   branch table (that should be fun).
+                // we need to return one uniform target state here
+            } else {
+                target_state
+            };
+            
+            // Conform to already-recorded needs:
+            //
+            // - for each actual ebb argument or live-in that is in a register but is wanted in the stack
+            //     spill it
+            //
+            // - for each actual ebb argument or live-in that is in a register and is wanted there
+            //     mark it as unspillable
+            //
+            // - for each actual ebb argument or live-in that is in a slot but is wanted in a register
+            //     fill it
+            //       -- this is a small core of the loop below
+            //       -- we exclude any unspillables from the set of candidates
+            //       -- filling could fail for same reasons documented below?!
+            //     mark the register as unspillable
+            //
+            // - for each actual ebb argument or live-in that is in a slot and is wanted in a slot
+            //     assert that it's in the right slot
+        }
+
         // We're looking for multiple uses of the same value, so start by sorting by value. The
         // secondary `opidx` key makes it possible to use an unstable (non-allocating) sort.
         self.reg_uses.sort_unstable_by_key(|u| (u.value, u.opidx));
-
-        // For branches, we probably care about non-fixed-args uses first, since they must be
-        // in registers, and then the variable args second, since they must be either as they are
-        // or must conform to the target.  For branches, var args will not be tied or fixed, and so
-        // a copy will not be needed (cssa may have inserted one).  Or, we care about the varargs
-        // first since they may have a predetermined location, and the fixed args second, since
-        // they can be placed in other registers.
-        //
-        // In some sense, then:
-        //   - if first time through the target
-        //       - we keep the var registers + target live-ins we have and flag them as nonspillable, no code is
-        //         generated; what's spilled is flagged as spilled, ditto; we take regs for
-        //         these
-        //       - we then ensure that any nonvar values we have are filled and then take regs
-        //         for all these values
-        //   - else
-        //       - any var registers + target live-ins we have that need to be in registers are flagged as
-        //         nonspillable
-        //       - any var registers + ditto we have that need to be spilled are spilled
-        //       - any var registers + ditto we have that need to be filled are filled (and these regs
-        //         are nonspillable)
-        //       - we then ensure that any nonvar values we have are filled and then take regs
-        //         for all these values
-        //
-        // We should not run out of registers for any of this, ie, all spills are explicit, by policy,
-        // not by capacity.  If a capacity spill is necessary then we need a do-over: we need to allocate
-        // a block w/o params which jumps w/ params to the target, then the branch branches to the new
-        // block w/o params.  We should only do this for branches that take register args, otherwise
-        // we should panic.
-        //
-        // -- 
-        //
-        // reg_uses are sorted, which is also wrong for branches.  but also note they may come in in
-        // reverse order, because they're pushed onto a vector by collect_reg_uses.
-        //
-        // several branch instrs have multiple non-flag non-var register arguments.  eg, br_icmp has
-        // two; br_table, brz, brnz all have one.
-        // 
 
         self.cur.use_srcloc(inst);
         for i in 0..self.reg_uses.len() {
@@ -599,59 +715,13 @@ impl<'a> Context<'a> {
                 false
             };
 
-            // TODO: Along a branch we must set up the ebb arguments just so.
-            //
-            // If we're the first branch to reach a destination (the spill state map has no entry
-            // for the target ebb) then we record the current affinities for the values that are
-            // live-in to that block and the ebb parameters along the edge in a spill state record
-            // for the ebb.  If a value is currently spilled its canonical location will be spilled;
-            // if it is in a register it will continue to be in a register.
-            //
-            // Otherwise, we may have to change the parameters here to conform to the state at the
-            // target block: If the target block has a spilled value but the value is in a register
-            // then we must spill it; if the target block requires a register value but it is
-            // spilled then we must fill it.  We can choose whether to do this only along the edge,
-            // or do it in-line and thus also affect the subsequent code in the ebb (soon to be bb,
-            // so only an unconditional jump at most).
-            //
-            // [Solved] There's a risk that conforming to a previous ebb can't happen, if that ebb
-            // decided to keep more values in registers than we have register for at the subsequent
-            // instruction.  This can happen if the original branch did not require any register
-            // values but the new branch does, leaving less space for values live-in to the target.
-            // However, it is only an issue with a real register, not a flags register, so I'm not
-            // sure how much of an issue it really is...  Table branches?  And if it's a problem it
-            // can be fixed by introducing an intermediate block: we branch conditionally w/o
-            // parameters to another block, and jump unconditional from that one with the necessary
-            // parameters in the correct place.
-            //
-            // Also, there's the possibility that we won't be able to make the correct spilling
-            // decision yet because we don't yet have the necessary liveness information for the
-            // target in terms of value names?  We have the parameters... but the liveins?  We get
-            // those from the target's immediate dominator, which *could* be this one ... the
-            // algorithm in ebb_top in the tracker can be adapted to compute the target's liveins
-            // for us.
-
             if need_copy {
                 let copy = self.insert_copy(ru.value, ru.rci);
                 self.cur.func.dfg.inst_args_mut(inst)[ru.opidx as usize] = copy;
             }
 
-            // TODO: Remove this comment
-            //
-            // TODO: Probably this loop is changed: we'll have one case for non-branch and another
-            // case for branch, as they'll be pretty different.
-
-
-            // TODO: This is different.  Here we must make the branch variable arguments
-            // conform to the target's expectations (if it has any) or record them as the
-            // expectations (if not).
-            //
-            // The branch fixed arguments must be handled as normal values but can't cause anything
-            // to be spilled that has been set up for the target.
-            
             // Even if we don't insert a copy, we may need to account for register pressure for the
             // reload pass.
-
             if need_copy || ru.spilled {
                 let rc = self.reginfo.rc(ru.rci);
                 while let Err(mask) = self.pressure.take_transient(rc) {
@@ -659,16 +729,37 @@ impl<'a> Context<'a> {
                     // Spill a live register that is *not* used by the current instruction.
                     // Spilling a use wouldn't help.
                     //
-                    // Do allow spilling of EBB arguments on branches. This is safe since we spill
-                    // the whole virtual register which includes the matching EBB parameter value
-                    // at the branch destination. It is also necessary since there can be
-                    // arbitrarily many EBB arguments.
+                    // Do allow spilling of EBB arguments on branches to the extent not prevented by
+                    // the pre-determined allocation.  This is safe if we're the first edge into a
+                    // join because other edges flowing to the same join will conform to the
+                    // allocation created here and also spill their values.
+                    //
+                    // Spilling EBB arguments is also necessary since there can be arbitrarily many
+                    // EBB arguments.
                     match {
-                        let args = if self.cur.func.dfg[inst].opcode().is_branch() {
-                            self.cur.func.dfg.inst_fixed_args(inst)
+                        let args = if is_branch {
+                            if target_state.is_none() {
+                                self.cur.func.dfg.inst_fixed_args(inst)
+                            } else {
+                                // It is possible to get into this situation eg if the first edge
+                                // into a join has passed a number of register values equal to the
+                                // number of registers available (via a Jump, say), and then a later
+                                // edge has the same number of parameters but needs additional
+                                // registers (a Branch of some kind).
+                                //
+                                // TODO: This should not panic!  On register-poor architectures we
+                                // should expect to hit this case frequently. What we really need to
+                                // do here is split the edge so that we can do a conditional jump to
+                                // a new block w/o parameters, and then do a unconditional jump from
+                                // the new block w/ parameters.
+                                panic!("Ran out of {} registers when trying to spill already-fixed EBB argument at {}",
+                                       rc,
+                                       self.cur.display_inst(inst));
+                            }
                         } else {
                             self.cur.func.dfg.inst_args(inst)
                         };
+                        // TODO: No unspillable args are candidates here!!
                         self.spill_candidate(
                             mask,
                             tracker.live().iter().filter(|lv| !args.contains(&lv.value)),
@@ -686,10 +777,18 @@ impl<'a> Context<'a> {
             
             if ru.spilled {
                 let fill = self.cur.ins().fill(ru.value);
-                let rci = self.locations.get(ru.value).unwrap().rci.unwrap();
+                self.record_representative(ru.value, fill);
+                let rci = self.locations.get(self.virtregs.get(ru.value).unwrap()).unwrap().rci.unwrap();
                 self.set_affinity(fill, Affinity::Reg(rci));
             }
         }
+
+        if is_branch && target_state.is_none() {
+            let targets = targets.unwrap();
+            // record the state that will be conformed to by other edges reaching the target(s) wrt
+            // ebb args and live-ins
+        }
+
         self.pressure.reset_transient();
         self.reg_uses.clear()
     }
@@ -753,13 +852,16 @@ impl<'a> Context<'a> {
 
         // Create a spill instruction with the appropriate slot for the spilled value, and set the
         // affinity for the spilled value.
-        let spill = self.cur.ins().copy(value);
+        let spill = self.cur.ins().spill(value);
+        self.record_representative(value, spill);
         let slot = self.get_spill_slot(value, rci);
         self.set_affinity(spill, Affinity::Stack);
     }
 
     fn get_spill_slot(&mut self, value: Value, rci: RegClassIndex) -> StackSlot {
-        match self.locations.get(value) {
+        debug_assert!(self.get_representative(value) == value);
+        let vr = self.virtregs.get(value).unwrap();
+        match self.locations.get(vr) {
             Some(ValueAndLocations { slot: Some(slot), .. }) => *slot,
             _ => {
                 let slot = self
@@ -767,7 +869,7 @@ impl<'a> Context<'a> {
                     .func
                     .stack_slots
                     .make_spill_slot(self.cur.func.dfg.value_type(value));
-                self.locations.insert(ValueAndLocations { value, slot: Some(slot), rci: Some(rci) });
+                self.locations.insert(ValueAndLocations { value: vr, slot: Some(slot), rci: Some(rci) });
                 slot
             }
         }
@@ -805,6 +907,20 @@ impl<'a> Context<'a> {
         self.set_affinity(copy, Affinity::Reg(rci));
 
         copy
+    }
+
+    // The value "repr" is the program-value that is the canonical representation for the newly
+    // introduced value "value".  Typically, "value" is created by a fill or spill.
+    fn record_representative(&mut self, repr: Value, value: Value) {
+        debug_assert!(self.get_representative(repr) == repr);
+        self.representative.insert(ValueRepr { value, repr });
+    }
+
+    fn get_representative(&self, value: Value) -> Value {
+        match self.representative.get(value) {
+            None => value,
+            Some(ValueRepr { repr, .. }) => *repr
+        }
     }
 }
 

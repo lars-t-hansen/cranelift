@@ -142,7 +142,7 @@ impl Context {
             func,
             domtree,
             &mut self.liveness,
-            &self.virtregs,
+            &mut self.virtregs,
             &mut self.topo,
             &mut self.tracker,
         );
