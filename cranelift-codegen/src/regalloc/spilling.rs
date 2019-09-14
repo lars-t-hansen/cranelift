@@ -641,7 +641,9 @@ impl<'a> Context<'a> {
 
         // If is_branch, then either target_state==None and targets is Some(vec), or
         // target_state=Some(..) and targets==None.  Otherwise (false,None,None).
-        let (is_branch, target_state, targets) = match self.cur.func.dfg[inst] {
+        let (is_branch, target_state, targets) : (bool, Option<Vec<EbbSpillState>>, Option<Ebb>) =
+/*
+            match self.cur.func.dfg[inst] {
             InstructionData::Branch { destination, .. } |
             InstructionData::BranchFloat { destination, .. } |
             InstructionData::BranchIcmp { destination, .. } |
@@ -660,9 +662,12 @@ impl<'a> Context<'a> {
                 (false, None, None)
             }
         };
+             */
+            (false, None, None);
 
         // first_time_through means first time we reach the target block(s)
         if is_branch && target_state.is_some() {
+/*
             let target_state = if target_state.unwrap().len() > 1 {
                 // branch table, and at least one of the blocks has constraints
                 // may need to create uniform constraints
@@ -671,9 +676,11 @@ impl<'a> Context<'a> {
                 //   insert unconstrained blocks for all of them and rewrite the
                 //   branch table (that should be fun).
                 // we need to return one uniform target state here
+                target_state.unwrap()[0]
             } else {
                 target_state
             };
+             */
             
             // Conform to already-recorded needs:
             //
