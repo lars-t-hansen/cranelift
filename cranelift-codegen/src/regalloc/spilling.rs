@@ -1,11 +1,11 @@
 //! Spilling pass.
 //!
-//! TODO/SPLITTER: Update this comment.
-//!
 //! The spilling pass is the first to run after the liveness analysis. Its primary function is to
-//! ensure that the register pressure never exceeds the number of available registers by moving
-//! some SSA values to spill slots on the stack. This is encoded in the affinity of the value's
-//! live range.
+//! ensure that the register pressure never exceeds the number of available registers by moving some
+//! SSA values to spill slots on the stack. To do this well, it splits live ranges of values that
+//! must be spilled by copying the values to and from stack-allocated slots as needed.
+//!
+//! The final location of a value is encoded in the "affinity" of the value's live range.
 //!
 //! Some instruction operand constraints may require additional registers to resolve. Since this
 //! can cause spilling, the spilling pass is also responsible for resolving those constraints by
@@ -16,6 +16,53 @@
 //! 2. When the same value is used more than once by an instruction, the operand constraints must
 //!    be compatible. Otherwise, the value must be copied into a new register for some of the
 //!    operands.
+//!
+//! Some values are more cheaply recomputed than spilled and restored, and the spilling pass inserts
+//! simple recomputations when it can in these cases:
+//!
+//! 1. TODO. When the value is a known constant that can be regenerated with a `t.const`
+//!    instruction.
+//!
+//! Live range splitting:
+//!
+//! When a live value has to be moved from a register because either (a) the register is needed for
+//! another value or (b) the register is about to be clobbered by a call, we copy the value into a
+//! stack location, terminate the live range of the value, and record that the original value now
+//! has a new name and is on the stack.  (Incoming stack parameters effectively start in a "spilled"
+//! state.)  When the value is subsequently needed to be in a register, we copy it from the stack
+//! location, create a new live range for the value, and record that the original value has yet a
+//! new name and is in a register.  Subsequent uses of the old name then instead become uses of the
+//! new name.  This general scheme ensures that values are in registers as much as possible.
+//!
+//! At a control flow join we then risk that a value that was previously live-in to the block now
+//! has multiple names and locations: the value may have been spilled and possibly restored along
+//! some paths into the block, or along all.  In this case, we must ensure that all the paths agree
+//! on the location of the value, if necessary by inserting spills or fills along some paths, and
+//! the block will have to accept the value as a new ebb parameter.  For the sake of simplicity, we
+//! let the first path into a block determine the location of the value (stack or register); other
+//! paths must conform.  (There are some complications here with table jumps and certain conditional
+//! jumps that can be resolved by splitting edges; see later.)
+//! 
+//! In the main, this is a two-pass algorithm.  The first pass ("splitting") makes a single RPO
+//! descent of the flow graph, inserting spill and fill instructions, and rematerializing constants.
+//! The second pass ("rectification") uses a worklist algorithm to insert new ebb parameters and to
+//! rename all uses; a worklist is needed to deal with loop back-edges.  After the two passes are
+//! finished, liveness information must be recomputed if any values were spilled.
+//!
+//! Rematerialization:
+//!
+//! TODO: Not implemented.
+//!
+//! When we need to spill a value we investigate its definition, and if the definition defines a
+//! constant (this is complicated for legalized floating-point constants) we instead record that the
+//! value was a constant, and when we later fill the value we re-introduce the constant under a new
+//! name.
+//!
+//! Rematerialization effectively splits a live range, but we do not want to insert ebb parameters
+//! at join points for a constant value, since that hides the fact that the value is a constant and
+//! prevents later rematerialization.  Instead, when we merge constants at join points we must
+//! effectively drop the incoming values and record that the constant exists so that it can be
+//! rematerialized in dominated nodes, as in the simple case.
 
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
@@ -559,38 +606,35 @@ impl<'a> Context<'a> {
 
     // TODO: Along a branch we must set up the ebb arguments just so.
     //
-    // If we're the first branch to reach a destination (the spill state map has no entry
-    // for the target ebb) then we record the current affinities for the values that are
-    // live-in to that block and the ebb parameters along the edge in a spill state record
-    // for the ebb.  If a value is currently spilled its canonical location will be spilled;
-    // if it is in a register it will continue to be in a register.
+    // If we're the first branch to reach a destination (the spill state map has no entry for the
+    // target ebb) then we record the current affinities for the values that are live-in to that
+    // block and the ebb parameters along the edge in a spill state record for the ebb.  If a value
+    // is currently spilled its canonical location will be spilled; if it is in a register it will
+    // continue to be in a register.
     //
-    // Otherwise, we may have to change the parameters here to conform to the state at the
-    // target block: If the target block has a spilled value but the value is in a register
-    // then we must spill it; if the target block requires a register value but it is
-    // spilled then we must fill it.  We can choose whether to do this only along the edge,
-    // or do it in-line and thus also affect the subsequent code in the ebb (soon to be bb,
-    // so only an unconditional jump at most).
+    // Otherwise, we may have to change the parameters here to conform to the state at the target
+    // block: If the target block has a spilled value but the value is in a register then we must
+    // spill it; if the target block requires a register value but it is spilled then we must fill
+    // it.  We can choose whether to do this only along the edge, or do it in-line and thus also
+    // affect the subsequent code in the ebb (soon to be bb, so only an unconditional jump at most).
     //
-    // [Solved] There's a risk that conforming to a previous ebb can't happen, if that ebb
-    // decided to keep more values in registers than we have register for at the subsequent
-    // instruction.  This can happen if the original branch did not require any register
-    // values but the new branch does, leaving less space for values live-in to the target.
-    // However, it is only an issue with a real register, not a flags register, so I'm not
-    // sure how much of an issue it really is...  Table branches?  And if it's a problem it
-    // can be fixed by introducing an intermediate block: we branch conditionally w/o
-    // parameters to another block, and jump unconditional from that one with the necessary
-    // parameters in the correct place.
+    // [Solved] There's a risk that conforming to a previous ebb can't happen, if that ebb decided
+    // to keep more values in registers than we have register for at the subsequent instruction.
+    // This can happen if the original branch did not require any register values but the new branch
+    // does, leaving less space for values live-in to the target.  However, it is only an issue with
+    // a real register, not a flags register, so I'm not sure how much of an issue it really is...
+    // Table branches?  And if it's a problem it can be fixed by introducing an intermediate block:
+    // we branch conditionally w/o parameters to another block, and jump unconditional from that one
+    // with the necessary parameters in the correct place.
     //
     // Several branch instrs have multiple non-flag non-var register arguments.  eg, br_icmp has
     // two; br_table, brz, brnz all have one.
     // 
-    // Also, there's the possibility that we won't be able to make the correct spilling
-    // decision yet because we don't yet have the necessary liveness information for the
-    // target in terms of value names?  We have the parameters... but the liveins?  We get
-    // those from the target's immediate dominator, which *could* be this one ... the
-    // algorithm in ebb_top in the tracker can be adapted to compute the target's liveins
-    // for us.
+    // Also, there's the possibility that we won't be able to make the correct spilling decision yet
+    // because we don't yet have the necessary liveness information for the target in terms of value
+    // names?  We have the parameters... but the liveins?  We get those from the target's immediate
+    // dominator, which *could* be this one ... the algorithm in ebb_top in the tracker can be
+    // adapted to compute the target's liveins for us.
     //
     // ---
     //
@@ -617,18 +661,18 @@ impl<'a> Context<'a> {
     //         for all these values
     //
     // We should not run out of registers for any of this, ie, all spills are explicit, by policy,
-    // not by capacity.  If a capacity spill is necessary then we need a do-over: we need to allocate
-    // a block w/o params which jumps w/ params to the target, then the branch branches to the new
-    // block w/o params.  We should only do this for branches that take register args, otherwise
-    // we should panic.
+    // not by capacity.  If a capacity spill is necessary then we need a do-over: we need to
+    // allocate a block w/o params which jumps w/ params to the target, then the branch branches to
+    // the new block w/o params.  We should only do this for branches that take register args,
+    // otherwise we should panic.
     //
-    // Note that none of the EBB parameters will be among the reg_uses; only the fixed params of
-    // a branch has been processed.  (Below, only the fixed params are excluded from being
-    // spilled in the original code.)
+    // Note that none of the EBB parameters will be among the reg_uses; only the fixed params of a
+    // branch has been processed.  (Below, only the fixed params are excluded from being spilled in
+    // the original code.)
     //
     // This all suggests that we first do a loop (conditionally) to handle any branch args, and
-    // exclude values thus found from further spilling.  Then we do the fixed args, which we
-    // handle with the existing logic, except that the candidate set is a little more complex.
+    // exclude values thus found from further spilling.  Then we do the fixed args, which we handle
+    // with the existing logic, except that the candidate set is a little more complex.
     //
 
     fn process_reg_uses(&mut self, inst: Inst, ebb_spill_state: &mut EbbSpillStateMap, tracker: &LiveValueTracker) {
