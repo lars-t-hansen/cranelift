@@ -66,7 +66,7 @@
 use crate::cursor::{Cursor, EncCursor};
 use crate::dominator_tree::DominatorTree;
 use crate::entity::{SecondaryMap, SparseMap, SparseMapValue};
-use crate::ir::{ArgumentLoc, Ebb, Function, Inst, InstBuilder, SigRef, StackSlot, Value};
+use crate::ir::{ArgumentLoc, Ebb, Function, Inst, InstBuilder, InstructionData, Opcode, SigRef, StackSlot, Value};
 use crate::isa::registers::{RegClass, RegClassIndex, RegClassMask, RegUnit};
 use crate::isa::{ConstraintKind, EncInfo, RecipeConstraints, RegInfo, TargetIsa};
 use crate::regalloc::affinity::Affinity;
@@ -89,10 +89,32 @@ fn toprc_containing_regunit(unit: RegUnit, reginfo: &RegInfo) -> RegClass {
         .expect("reg unit should be in a toprc")
 }
 
-/// The spill state of a single value at EBB entry, see EbbSpillState below.
+// For each ebb s.t. we've not yet processed all its predecessors in the RPO splitting pass but
+// where we've processed at least one control flow instruction that reaches it, we maintain a "spill
+// state" data structure that holds information about the locations of values that are live on entry
+// to the ebb.
+//
+// This information is applied to our global value location structure when we start processing the
+// ebb by iterating across the values that are live at the start of the ebb (including ebb
+// parameters), so the spill state must have a map from value -> affinity for all those values.
+//
+// The information is also used when we process edges that reach the ebb, after the first such edge.
+// In this case we check whether the affinities of values that are live at the start of the ebb are
+// the same of the affinities coming in along subsequent edges; if not, fixup code must be inserted
+// along those edges.  For this, we need a map from the true live-in values to their desired
+// affinities (this is a submap of the map mentioned in the previous paragraph and we can use that,
+// provided we're careful about iterating over the live-in values and not over the map), and an
+// ordered list of affinities for ebb arguments.
+//
+// TODO/SPLITTER: In the future, the EbbSpillState will also hold information about rematerializable
+// values.
+
+/// The spill state of a single value at EBB entry.
+#[derive(Copy, Clone)]
 struct SpillState {
-    value: Value,
-    affinity: Affinity,         // only Stack or Reg(rci)
+    value: Value,               // Name of the live-in or the block parameter
+    affinity: Affinity,         // Only Stack or Reg(rci)
+    is_live_in: bool,           // An entry is live-in or a block parameter
 }
 
 impl SparseMapValue<Value> for SpillState {
@@ -103,15 +125,11 @@ impl SparseMapValue<Value> for SpillState {
 
 type SpillStateMap = SparseMap<Value, SpillState>;
 
-/// Here we have info about the current incoming spill state of the EBB.  The structure is first
-/// created when we first encounter an EBB in the RPO walk, and then updated as we reach the ebb
-/// through other paths.  When we process the EBB, we apply the state herein before processing the
-/// instructions of the EBB.  We seed this map with info about the entry block.
-///
-/// The spill state includes both live-in names and parameter names.
+/// The spill state of an EBB at EBB entry.
 struct EbbSpillState {
     key: Ebb,
-    ss: SpillStateMap,
+    args: Vec<Affinity>,         // Only Stack or Reg(rci)
+    values: SpillStateMap,
 }
 
 impl SparseMapValue<Ebb> for EbbSpillState {
@@ -152,6 +170,12 @@ impl SparseMapValue<Value> for ValueRepr {
     fn key(&self) -> Value {
         self.value
     }
+}
+
+enum Target {
+    None,
+    Single(Ebb),
+    Multiple(Vec<Ebb>)
 }
 
 /// Persistent data structures for the spilling pass.
@@ -275,7 +299,7 @@ impl<'a> Context<'a> {
             self.visit_ebb(ebb, ebb_spill_state, tracker);
         }
 
-        // TODO: Rectification pass
+        // TODO/SPLITTER: Rectification pass
     }
 
     // Seed the spill state with information about the entry block.
@@ -293,22 +317,26 @@ impl<'a> Context<'a> {
         debug_assert_eq!(liveins.len(), 0);
         debug_assert_eq!(self.cur.func.signature.params.len(), params.len());
 
-        let mut ss = SparseMap::new();
+        let mut values = SpillStateMap::new();
+        let mut args = vec![];
         for (param_idx, param) in params.iter().enumerate() {
+            let abi = self.cur.func.signature.params[param_idx];
+            let affinity = Affinity::abi(&abi, self.isa);
             if !param.is_dead {
-                let abi = self.cur.func.signature.params[param_idx];
-                let affinity = Affinity::abi(&abi, self.isa);
-                ss.insert(SpillState { value: param.value,
-                                       affinity });
+                values.insert(SpillState { value: param.value,
+                                           affinity,
+                                           is_live_in: false });
                 self.locations.insert(ValueAndLocations { value: self.virtregs.get(param.value).unwrap(),
                                                           slot: None,
                                                           rci: Some(self.cur.isa.regclass_for_abi_type(abi.value_type).into()) });
             }
+            args.push(affinity);
         };
 
         ebb_spill_state.insert(EbbSpillState {
             key: entry,
-            ss,
+            args,
+            values,
         });
     }
 
@@ -334,11 +362,14 @@ impl<'a> Context<'a> {
         }
     }
 
+    // TODO/SPLITTER: Here, we really do want to lookup by name, so we need the name->affinity
+    // mapping.
+
     fn apply_spill_state(&mut self, ebb: Ebb, ebb_spill_state: &mut EbbSpillStateMap, tracker: &mut LiveValueTracker) {
-        // TODO: In debug builds, set all affinities to Unassigned before applying the state.
-        let ss = &ebb_spill_state.get(ebb).unwrap().ss;
+        // TODO/SPLITTER: In debug builds, set all affinities to Unassigned before applying the state.
+        let values = &ebb_spill_state.get(ebb).unwrap().values;
         for lv in tracker.live() {
-            let affinity = ss.get(lv.value).unwrap().affinity;
+            let affinity = values.get(lv.value).unwrap().affinity;
             self.set_affinity(lv.value, affinity);
         }
     }
@@ -441,7 +472,7 @@ impl<'a> Context<'a> {
             self.collect_abi_reg_uses(inst, sig);
         }
 
-        if !self.reg_uses.is_empty() {
+        if !self.reg_uses.is_empty() || self.cur.func.dfg[inst].opcode().is_branch() {
             self.process_reg_uses(inst, ebb_spill_state, tracker);
         }
 
@@ -604,7 +635,7 @@ impl<'a> Context<'a> {
     //
     // Leave `self.reg_uses` empty.
 
-    // TODO: Along a branch we must set up the ebb arguments just so.
+    // TODO/SPLITTER: Along a branch we must set up the ebb arguments just so.
     //
     // If we're the first branch to reach a destination (the spill state map has no entry for the
     // target ebb) then we record the current affinities for the values that are live-in to that
@@ -673,44 +704,71 @@ impl<'a> Context<'a> {
     // This all suggests that we first do a loop (conditionally) to handle any branch args, and
     // exclude values thus found from further spilling.  Then we do the fixed args, which we handle
     // with the existing logic, except that the candidate set is a little more complex.
-    //
 
     fn process_reg_uses(&mut self, inst: Inst, ebb_spill_state: &mut EbbSpillStateMap, tracker: &LiveValueTracker) {
-
-        // TODO: Note this could be multiple targets for table-jump but they all have no ebb params
-        // and the same live-ins.  The problem is that *some* of the blocks may have been reached
-        // from elsewhere before.  The ACTUAL problem is that those blocks may not be in sync wrt to
-        // their live-in locations.  In that case, fixup blocks must be inserted along the paths
-        // that violate the prior assumptions.
-
-        // If is_branch, then either target_state==None and targets is Some(vec), or
-        // target_state=Some(..) and targets==None.  Otherwise (false,None,None).
-        let (is_branch, target_state, targets) : (bool, Option<Vec<EbbSpillState>>, Option<Ebb>) =
-/*
+        // `first_time` is true only if none of the targets have been reached previously.
+        let (is_branch, targets, first_time) =
             match self.cur.func.dfg[inst] {
-            InstructionData::Branch { destination, .. } |
-            InstructionData::BranchFloat { destination, .. } |
-            InstructionData::BranchIcmp { destination, .. } |
-            InstructionData::BranchInt { destination, .. } |
-            InstructionData::Jump { destination, .. } => {
-                match ebb_spill_state.get(destination) {
-                    Some(target_state) => (true, Some(vec![target_state]), None),
-                    None => (true, None, Some(vec![target_state]))
+                InstructionData::Branch { destination, .. } |
+                InstructionData::BranchFloat { destination, .. } |
+                InstructionData::BranchIcmp { destination, .. } |
+                InstructionData::BranchInt { destination, .. } |
+                InstructionData::Jump { destination, .. } => {
+                    (true, Target::Single(destination), !ebb_spill_state.contains_key(destination))
                 }
-            }
-            InstructionData::BranchTable { opcode, .. } |
-            InstructionData::BranchTableBase { opcode, .. } |
-            InstructionData::BranchTableEntry { opcode, .. } |
-            _ => {
-                debug_assert!(!self.cur.func.dfg[inst].opcode().is_branch());
-                (false, None, None)
-            }
-        };
-             */
-            (false, None, None);
+                InstructionData::IndirectJump { table, .. } => {
+                    debug_assert!(self.cur.func.dfg[inst].opcode() == Opcode::IndirectJumpTableBr);
+                    let mut targets = vec![];
+                    targets.extend_from_slice(self.cur.func.jump_tables[table].as_slice());
+                    let first_time = !targets.iter().any(|destination| ebb_spill_state.contains_key(*destination));
+                    (true, Target::Multiple(targets), first_time)
+                }
+                _ => {
+                    // Should not see Fallthrough here, and all others should have been handled.
+                    debug_assert!(!self.cur.func.dfg[inst].opcode().is_branch());
+                    (false, Target::None, false)
+                }
+            };
 
-        // first_time_through means first time we reach the target block(s)
-        if is_branch && target_state.is_some() {
+        // Handle the case where a jump has to conform to previous constraints on the target block.
+        if is_branch && !first_time {
+
+            // First compute the desired target state.  In the case of a table jump we just pick one
+            // of them.  Code below will insert fixup blocks as necessary, and may record constraints
+            // for table jump blocks that were not previously reached.
+
+            let target_spill_state =
+                match &targets {
+                    Target::Single(target) => {
+                        ebb_spill_state.get(*target).unwrap()
+                    }
+                    Target::Multiple(targets) => {
+                        targets.iter().filter_map(|destination| ebb_spill_state.get(*destination)).take(1).next().unwrap()
+                    }
+                    _ => unreachable!()
+            };
+
+            //
+            // TODO/SPLITTER: Note this could be multiple targets for table-jump but they all have
+            // no ebb params and the same live-ins.  The problem is that *some* of the blocks may
+            // have been reached from elsewhere before.  The ACTUAL problem is that those blocks may
+            // not be in sync wrt to their live-in locations.  In that case, fixup blocks must be
+            // inserted along the paths that violate the prior assumptions.
+
+            //for each v in live_ins(target)
+            //  ...
+            //
+            //for each actual.zip(formal) of target
+            //  ..
+
+            // This gets us the live-ins at the target at this point in the program logic:
+            //   let live_ins = tracker.live_in_at_ebb_for_unprocessed_branch(target, inst, ...);
+            
+        // TODO/SPLITTER: When merging paths, we need something more than name->affinity mapping.
+        // We need ordered lists for the ebb parameters, and we need sets of live-in names to the
+        // target block.  For multi-target, the set of live-ins will be the same for all blocks, but
+        // they can have different affinity.
+
 /*
             let target_state = if target_state.unwrap().len() > 1 {
                 // branch table, and at least one of the blocks has constraints
@@ -789,7 +847,7 @@ impl<'a> Context<'a> {
                     // EBB arguments.
                     match {
                         let args = if is_branch {
-                            if target_state.is_none() {
+                            if first_time {
                                 self.cur.func.dfg.inst_fixed_args(inst)
                             } else {
                                 // It is possible to get into this situation eg if the first edge
@@ -798,7 +856,7 @@ impl<'a> Context<'a> {
                                 // edge has the same number of parameters but needs additional
                                 // registers (a Branch of some kind).
                                 //
-                                // TODO: This should not panic!  On register-poor architectures we
+                                // TODO/SPLITTER: This should not panic!  On register-poor architectures we
                                 // should expect to hit this case frequently. What we really need to
                                 // do here is split the edge so that we can do a conditional jump to
                                 // a new block w/o parameters, and then do a unconditional jump from
@@ -810,7 +868,7 @@ impl<'a> Context<'a> {
                         } else {
                             self.cur.func.dfg.inst_args(inst)
                         };
-                        // TODO: No unspillable args are candidates here!!
+                        // TODO/SPLITTER: No unspillable args are candidates here!!
                         self.spill_candidate(
                             mask,
                             tracker.live().iter().filter(|lv| !args.contains(&lv.value)),
@@ -835,8 +893,7 @@ impl<'a> Context<'a> {
             }
         }
 
-        if is_branch && target_state.is_none() {
-            let targets = targets.unwrap();
+        if is_branch && first_time {
             // record the state that will be conformed to by other edges reaching the target(s) wrt
             // ebb args and live-ins
         }
@@ -846,6 +903,9 @@ impl<'a> Context<'a> {
     }
 
     // Find a spill candidate from `candidates` whose top-level register class is in `mask`.
+    //
+    // TODO/SPLITTER: This should probably prefer registers holding rematerializable values,
+    // over other registers.
     fn spill_candidate<'ii, II>(&self, mask: RegClassMask, candidates: II) -> Option<Value>
     where
         II: IntoIterator<Item = &'ii LiveValue>,

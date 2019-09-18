@@ -232,6 +232,56 @@ impl LiveValueTracker {
         self.live.values.split_at(first_arg)
     }
 
+    /// Derived from ebb_top().  Returns a vector of the LiveValues that are live-in at the ebb.
+    /// Does not consider ebb parameters.
+    ///
+    /// Same constraints as ebb_top(): the immediate dominator must already have been visited.
+    pub fn live_in_at_ebb_for_unprocessed_branch(
+        &mut self,
+        ebb: Ebb,
+        inst: Inst,
+        dfg: &DataFlowGraph,
+        liveness: &Liveness,
+        layout: &Layout,
+        domtree: &DominatorTree,
+    ) -> Vec<LiveValue> {
+        let mut live = vec![];
+
+        // Save a copy of the live values before any branches or jumps that could be somebody's
+        // immediate dominator.
+        debug_assert!(dfg[inst].opcode().is_branch());
+        self.save_idom_live_set(inst);
+
+        if let Some(idom) = domtree.idom(ebb) {
+            // If the immediate dominator exits, we must have a stored list for it. This is a
+            // requirement to the order EBBs are visited: All dominators must have been processed
+            // before the current EBB.
+            let idom_live_list = self
+                .idom_sets
+                .get(&idom)
+                .expect("No stored live set for dominator");
+            let ctx = liveness.context(layout);
+            // Get just the values that are live-in to `ebb`.
+            for &value in idom_live_list.as_slice(&self.idom_pool) {
+                let lr = liveness
+                    .get(value)
+                    .expect("Immediate dominator value has no live range");
+
+                // Check if this value is live-in here.
+                if let Some(endpoint) = lr.livein_local_end(ebb, ctx) {
+                    live.push(LiveValue { value,
+                                          endpoint,
+                                          affinity: lr.affinity,
+                                          is_local: lr.is_local(),
+                                          is_dead: lr.is_dead(),
+                    });
+                }
+            }
+        }
+
+        live
+    }
+
     /// Prepare to move past `inst`.
     ///
     /// Determine the set of already live values that are killed by `inst`, and add the new defined
