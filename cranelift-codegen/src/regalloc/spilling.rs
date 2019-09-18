@@ -53,15 +53,14 @@
 //!
 //! TODO: Not implemented.
 //!
-//! When we need to spill a value we investigate its definition, and if the definition defines a
-//! constant (this is complicated for legalized floating-point constants) we instead record that the
-//! value was a constant, and when we later fill the value we re-introduce the constant under a new
-//! name.
+//! When we need to spill a value we examine its definition, and if that defines a constant we
+//! instead record that the value was a constant, and when we later fill the value we re-introduce
+//! the constant under a new name.
 //!
 //! Rematerialization effectively splits a live range, but we do not want to insert ebb parameters
 //! at join points for a constant value, since that hides the fact that the value is a constant and
 //! prevents later rematerialization.  Instead, when we merge constants at join points we must
-//! effectively drop the incoming values and record that the constant exists so that it can be
+//! effectively forget the incoming values and record that the constant exists so that it can be
 //! rematerialized in dominated nodes, as in the simple case.
 
 use crate::cursor::{Cursor, EncCursor};
@@ -188,10 +187,11 @@ struct Context<'a> {
     // Uses of register values in the current instruction.
     reg_uses: &'a mut Vec<RegUse>,
 
-    // Set to true if new names were created in such a way that liveness analysis must be rerun.
+    // Set to true if any new names were created in such a way that liveness analysis must be rerun
+    // (not all name introductions require this).
     liveness_invalidated: bool,
 
-    // Storage used during pass1 (currently).
+    // Mapping of live values to our current notion of affinity for the value.
     affinities: SecondaryMap<Value, Affinity>,
 
     // For each representative value, map the VR of that value to information about storage
@@ -828,6 +828,7 @@ impl<'a> Context<'a> {
             
             if ru.spilled {
                 let fill = self.cur.ins().fill(ru.value);
+                self.liveness_invalidated = true;
                 self.record_representative(ru.value, fill);
                 let rci = self.locations.get(self.virtregs.get(ru.value).unwrap()).unwrap().rci.unwrap();
                 self.set_affinity(fill, Affinity::Reg(rci));
@@ -904,6 +905,7 @@ impl<'a> Context<'a> {
         // Create a spill instruction with the appropriate slot for the spilled value, and set the
         // affinity for the spilled value.
         let spill = self.cur.ins().spill(value);
+        self.liveness_invalidated = true;
         self.record_representative(value, spill);
         let slot = self.get_spill_slot(value, rci);
         self.set_affinity(spill, Affinity::Stack);
